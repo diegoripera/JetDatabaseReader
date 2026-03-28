@@ -773,29 +773,29 @@ namespace JetDatabaseReader
         /// Returns column headers, sampled rows (as strings), and per-column schema.
         /// Useful for previewing table structure and data.
         /// </summary>
-        public TablePreviewResult ReadTable(string tableName, int maxRows)
+        public TableResult ReadTable(string tableName, int maxRows)
         {
             CatalogEntry entry = GetCatalogEntry(tableName);
 
             if (entry == null)
-                return new TablePreviewResult
+                return new TableResult
                 {
                     Headers = new List<string>(),
                     Rows    = new List<List<string>>(),
-                    Schema  = new List<TablePreviewColumn>()
+                    Schema  = new List<TableColumn>()
                 };
 
             TableDef td = ReadTableDef(entry.TDefPage);
             if (td == null || td.Columns.Count == 0)
-                return new TablePreviewResult
+                return new TableResult
                 {
                     Headers = new List<string>(),
                     Rows    = new List<List<string>>(),
-                    Schema  = new List<TablePreviewColumn>()
+                    Schema  = new List<TableColumn>()
                 };
 
             var headers = td.Columns.ConvertAll(c => c.Name);
-            var schema  = td.Columns.ConvertAll(c => new TablePreviewColumn
+            var schema  = td.Columns.ConvertAll(c => new TableColumn
             {
                 Name     = c.Name,
                 TypeName = TypeCodeToName(c.Type),
@@ -817,7 +817,7 @@ namespace JetDatabaseReader
                 }
             }
 
-            return new TablePreviewResult { Headers = headers, Rows = rows, Schema = schema };
+            return new TableResult { Headers = headers, Rows = rows, Schema = schema };
         }
 
         private static string TypeCodeToName(byte t)
@@ -1188,7 +1188,7 @@ namespace JetDatabaseReader
         /// Async overload of <see cref="ReadTable(string, int)"/>.
         /// Reads up to <paramref name="maxRows"/> rows and schema information asynchronously.
         /// </summary>
-        public Task<TablePreviewResult> ReadTableAsync(string tableName, int maxRows)
+        public Task<TableResult> ReadTableAsync(string tableName, int maxRows)
         {
             return Task.Run(() => ReadTable(tableName, maxRows));
         }

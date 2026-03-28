@@ -244,7 +244,7 @@ namespace JetDatabaseReader.Tests
             using var reader = TestDatabases.Open(path);
             string table = reader.ListTables()[0];
 
-            TablePreviewResult preview = reader.ReadTable(table, maxRows: 10);
+            TableResult preview = reader.ReadTable(table, maxRows: 10);
 
             preview.Headers.Should().HaveCount(preview.Schema.Count);
             for (int i = 0; i < preview.Headers.Count; i++)
@@ -259,7 +259,7 @@ namespace JetDatabaseReader.Tests
             string table = reader.ListTables()[0];
             const int max = 5;
 
-            TablePreviewResult preview = reader.ReadTable(table, maxRows: max);
+            TableResult preview = reader.ReadTable(table, maxRows: max);
 
             preview.Rows.Should().HaveCountLessThanOrEqualTo(max);
         }
@@ -271,7 +271,7 @@ namespace JetDatabaseReader.Tests
             using var reader = TestDatabases.Open(path);
             string table = reader.ListTables()[0];
 
-            TablePreviewResult preview = reader.ReadTable(table, maxRows: 20);
+            TableResult preview = reader.ReadTable(table, maxRows: 20);
 
             foreach (var row in preview.Rows)
                 row.Should().HaveCount(preview.Headers.Count);

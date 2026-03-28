@@ -12,7 +12,7 @@ This project follows [Semantic Versioning](https://semver.org/).
 | Area | v1 behaviour | v2 behaviour |
 |------|-------------|-------------|
 | **Constructor** | `new JetDatabaseReader(path)` | `AccessReader.Open(path)` — factory method required |
-| **`ReadTable()`** | Returned `(headers, rows, schema)` tuple | **Renamed** to `ReadTablePreview()` |
+| **`ReadTable()`** | Returned `(headers, rows, schema)` tuple | Now an overload — `ReadTable(string, int)` returns `TableResult` |
 | **`ReadTableAsDataTable()`** | Returned `DataTable` with `string` columns | **Renamed** to `ReadTableAsStringDataTable()` |
 | **`StreamRows()`** | Returned `IEnumerable<string[]>` | Now returns `IEnumerable<object[]>` with native CLR types |
 | **`ReadAllTables()`** | Returned `DataTable` with `string` columns | Now returns `DataTable` with typed CLR columns |
@@ -23,7 +23,9 @@ This project follows [Semantic Versioning](https://semver.org/).
 | Method | Description |
 |--------|-------------|
 | `ReadTable()` | Primary read method — typed `DataTable` (replaces `ReadTableAsDataTableTyped`) |
+| `ReadTable(string, int)` | Sampled-rows overload — returns `TableResult` (headers, rows, schema) |
 | `ReadTableAsync()` | Async typed `DataTable` |
+| `ReadTableAsync(string, int)` | Async sampled-rows overload — returns `Task<TableResult>` |
 | `StreamRowsAsStrings()` | Compatibility streaming — `IEnumerable<string[]>` |
 | `ReadAllTablesAsStrings()` | Bulk read with string columns |
 | `ReadAllTablesAsStringsAsync()` | Async bulk read with string columns |
@@ -36,6 +38,8 @@ This project follows [Semantic Versioning](https://semver.org/).
 | `TableQuery.Count()` / `CountAsStrings()` | Count per chain |
 | `GetColumnMetadata()` | Rich per-column metadata with CLR type |
 | `GetStatistics()` / `GetStatisticsAsync()` | Database-level statistics + cache hit rate |
+| `TableResult` | Result type for sampled-rows overload — `Headers`, `Rows`, `Schema` |
+| `TableColumn` | Schema entry — `Name`, `TypeName`, `SizeDesc` |
 
 ### 🔧 Improvements
 
@@ -68,11 +72,12 @@ DataTable dt = r.ReadTableAsDataTable("Orders");
 // v2
 DataTable dt = r.ReadTableAsStringDataTable("Orders");
 
-// ── Preview with schema ──────────────────────────────────────────────
+// ── Sample with schema ──────────────────────────────────────────────
 // v1
 var (h, rows, schema) = r.ReadTable("Orders", maxRows: 10);
 // v2
-var (h, rows, schema) = r.ReadTablePreview("Orders", maxRows: 10);
+TableResult p = r.ReadTable("Orders", 10);
+// p.Headers / p.Rows / p.Schema[i].Name, .TypeName, .SizeDesc
 
 // ── Stream rows (typed) ──────────────────────────────────────────────
 // v1

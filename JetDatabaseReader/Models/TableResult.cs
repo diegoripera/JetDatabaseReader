@@ -3,9 +3,9 @@ using System.Collections.Generic;
 namespace JetDatabaseReader
 {
     /// <summary>
-    /// Schema entry for a single column in a <see cref="TablePreviewResult"/>.
+    /// Schema entry for a single column in a <see cref="TableResult"/>.
     /// </summary>
-    public sealed class TablePreviewColumn
+    public sealed class TableColumn
     {
         /// <summary>Column name.</summary>
         public string Name { get; set; }
@@ -18,10 +18,10 @@ namespace JetDatabaseReader
     }
 
     /// <summary>
-    /// Result returned by <see cref="IAccessReader.ReadTablePreview"/>.
+    /// Result returned by <see cref="IAccessReader.ReadTable(string, int)"/>.
     /// Contains column headers, sampled rows (as strings), and per-column schema information.
     /// </summary>
-    public sealed class TablePreviewResult
+    public sealed class TableResult
     {
         /// <summary>Ordered list of column names.</summary>
         public List<string> Headers { get; set; }
@@ -30,6 +30,6 @@ namespace JetDatabaseReader
         public List<List<string>> Rows { get; set; }
 
         /// <summary>Per-column schema information in the same order as <see cref="Headers"/>.</summary>
-        public List<TablePreviewColumn> Schema { get; set; }
+        public List<TableColumn> Schema { get; set; }
     }
 }
