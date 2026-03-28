@@ -97,9 +97,9 @@ DataTable dt = reader.ReadTableAsStringDataTable("Products");
 ### Table preview with schema
 
 ```csharp
-var (headers, rows, schema) = reader.ReadTablePreview("Products", maxRows: 20);
-foreach (var (name, typeName, size) in schema)
-    Console.WriteLine($"{name}: {typeName} ({size})");
+TablePreviewResult preview = reader.ReadTable("Products", maxRows: 20);
+foreach (TablePreviewColumn col in preview.Schema)
+    Console.WriteLine($"{col.Name}: {col.TypeName} ({col.SizeDesc})");
 ```
 
 ---
@@ -247,8 +247,8 @@ var dt = r.ReadTable("Orders");                        // v2 ✅ typed
 var dt = r.ReadTableAsStringDataTable("Orders");       // v2 compat
 
 // Preview
-var t = r.ReadTable("T", maxRows: 10);                 // v1 — tuple
-var t = r.ReadTablePreview("T", maxRows: 10);          // v2 ✅
+var t = r.ReadTable("T", maxRows: 10);                 // v1 ❌ — returned a tuple
+TablePreviewResult t = r.ReadTable("T", 10);           // v2 ✅ typed result
 
 // Streaming
 foreach (string[] row in r.StreamRows("T"))            // v1

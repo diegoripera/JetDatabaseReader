@@ -235,46 +235,46 @@ namespace JetDatabaseReader.Tests
             tableCount.Should().BeGreaterThan(0);
         }
 
-        // ── ReadTablePreview ──────────────────────────────────────────────
+        // ── ReadTable (preview overload) ──────────────────────────────────
 
         [Theory]
         [MemberData(nameof(TestDatabases.All), MemberType = typeof(TestDatabases))]
-        public void ReadTablePreview_HeadersMatchSchemaColumnNames(string path)
+        public void ReadTable_Preview_HeadersMatchSchemaColumnNames(string path)
         {
             using var reader = TestDatabases.Open(path);
             string table = reader.ListTables()[0];
 
-            var (headers, _, schema) = reader.ReadTablePreview(table, maxRows: 10);
+            TablePreviewResult preview = reader.ReadTable(table, maxRows: 10);
 
-            headers.Should().HaveCount(schema.Count);
-            for (int i = 0; i < headers.Count; i++)
-                headers[i].Should().Be(schema[i].Name);
+            preview.Headers.Should().HaveCount(preview.Schema.Count);
+            for (int i = 0; i < preview.Headers.Count; i++)
+                preview.Headers[i].Should().Be(preview.Schema[i].Name);
         }
 
         [Theory]
         [MemberData(nameof(TestDatabases.All), MemberType = typeof(TestDatabases))]
-        public void ReadTablePreview_RowCount_DoesNotExceedMaxRows(string path)
+        public void ReadTable_Preview_RowCount_DoesNotExceedMaxRows(string path)
         {
             using var reader = TestDatabases.Open(path);
             string table = reader.ListTables()[0];
             const int max = 5;
 
-            var (_, rows, _) = reader.ReadTablePreview(table, maxRows: max);
+            TablePreviewResult preview = reader.ReadTable(table, maxRows: max);
 
-            rows.Should().HaveCountLessThanOrEqualTo(max);
+            preview.Rows.Should().HaveCountLessThanOrEqualTo(max);
         }
 
         [Theory]
         [MemberData(nameof(TestDatabases.All), MemberType = typeof(TestDatabases))]
-        public void ReadTablePreview_EachRow_HasSameColumnCountAsHeaders(string path)
+        public void ReadTable_Preview_EachRow_HasSameColumnCountAsHeaders(string path)
         {
             using var reader = TestDatabases.Open(path);
             string table = reader.ListTables()[0];
 
-            var (headers, rows, _) = reader.ReadTablePreview(table, maxRows: 20);
+            TablePreviewResult preview = reader.ReadTable(table, maxRows: 20);
 
-            foreach (var row in rows)
-                row.Should().HaveCount(headers.Count);
+            foreach (var row in preview.Rows)
+                row.Should().HaveCount(preview.Headers.Count);
         }
 
         // ── Dispose ───────────────────────────────────────────────────────

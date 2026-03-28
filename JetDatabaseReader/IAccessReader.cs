@@ -55,13 +55,16 @@ namespace JetDatabaseReader
         /// <summary>
         /// Reads up to <paramref name="maxRows"/> rows from the table named
         /// <paramref name="tableName"/> (case-insensitive).
-        /// Also returns column schema (name, friendly type name, size description).
+        /// Returns column headers, sampled rows (as strings), and per-column schema.
         /// Useful for previewing table structure and data.
         /// </summary>
-        (List<string> Headers,
-                List<List<string>> Rows,
-                List<(string Name, string TypeName, string SizeDesc)> Schema)
-            ReadTablePreview(string tableName, int maxRows = 100);
+        TablePreviewResult ReadTable(string tableName, int maxRows);
+
+        /// <summary>
+        /// Async overload of <see cref="ReadTable(string, int)"/>.
+        /// Reads up to <paramref name="maxRows"/> rows and schema information asynchronously.
+        /// </summary>
+        Task<TablePreviewResult> ReadTableAsync(string tableName, int maxRows);
 
         /// <summary>
         /// Yields rows from <paramref name="tableName"/> as properly typed object arrays without collecting them all in memory.

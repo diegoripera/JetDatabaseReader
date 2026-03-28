@@ -770,30 +770,39 @@ namespace JetDatabaseReader
         /// <summary>
         /// Reads up to <paramref name="maxRows"/> rows from the table named
         /// <paramref name="tableName"/> (case-insensitive).
-        /// Also returns column schema (name, friendly type name, size description).
+        /// Returns column headers, sampled rows (as strings), and per-column schema.
         /// Useful for previewing table structure and data.
         /// </summary>
-        public (List<string> Headers,
-                List<List<string>> Rows,
-                List<(string Name, string TypeName, string SizeDesc)> Schema)
-            ReadTablePreview(string tableName, int maxRows = 100)
+        public TablePreviewResult ReadTable(string tableName, int maxRows)
         {
             CatalogEntry entry = GetCatalogEntry(tableName);
 
             if (entry == null)
-                return (new List<string>(), new List<List<string>>(),
-                        new List<(string, string, string)>());
+                return new TablePreviewResult
+                {
+                    Headers = new List<string>(),
+                    Rows    = new List<List<string>>(),
+                    Schema  = new List<TablePreviewColumn>()
+                };
 
             TableDef td = ReadTableDef(entry.TDefPage);
             if (td == null || td.Columns.Count == 0)
-                return (new List<string>(), new List<List<string>>(),
-                        new List<(string, string, string)>());
+                return new TablePreviewResult
+                {
+                    Headers = new List<string>(),
+                    Rows    = new List<List<string>>(),
+                    Schema  = new List<TablePreviewColumn>()
+                };
 
             var headers = td.Columns.ConvertAll(c => c.Name);
-            var schema  = td.Columns.ConvertAll(c =>
-                (c.Name, TypeCodeToName(c.Type), SizeDescForColumn(c)));
-            var rows    = new List<List<string>>();
-            long total  = _fs.Length / _pgSz;
+            var schema  = td.Columns.ConvertAll(c => new TablePreviewColumn
+            {
+                Name     = c.Name,
+                TypeName = TypeCodeToName(c.Type),
+                SizeDesc = SizeDescForColumn(c)
+            });
+            var rows  = new List<List<string>>();
+            long total = _fs.Length / _pgSz;
 
             for (long p = 3; p < total && rows.Count < maxRows; p++)
             {
@@ -808,7 +817,7 @@ namespace JetDatabaseReader
                 }
             }
 
-            return (headers, rows, schema);
+            return new TablePreviewResult { Headers = headers, Rows = rows, Schema = schema };
         }
 
         private static string TypeCodeToName(byte t)
@@ -1173,6 +1182,15 @@ namespace JetDatabaseReader
         public Task<DataTable> ReadTableAsync(string tableName = null, IProgress<int> progress = null)
         {
             return Task.Run(() => ReadTable(tableName, progress));
+        }
+
+        /// <summary>
+        /// Async overload of <see cref="ReadTable(string, int)"/>.
+        /// Reads up to <paramref name="maxRows"/> rows and schema information asynchronously.
+        /// </summary>
+        public Task<TablePreviewResult> ReadTableAsync(string tableName, int maxRows)
+        {
+            return Task.Run(() => ReadTable(tableName, maxRows));
         }
 
         /// <summary>
