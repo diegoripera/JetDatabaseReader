@@ -127,6 +127,12 @@ namespace JetDatabaseReader
         private long _cacheMisses;
         private readonly bool _isPasswordProtected;
 
+        /// <summary>Page decryptor for an encrypted ACE database; null when pages are plain text.</summary>
+        private AgileEncryption _crypto;
+
+        /// <summary>Difference between a page number and its encryption segment index.</summary>
+        private int _segmentOffset;
+
         /// <summary>When true, GetUserTables logs verbose hex dumps for debugging. Default: false.</summary>
         public bool DiagnosticsEnabled { get; set; }
 
@@ -175,9 +181,10 @@ namespace JetDatabaseReader
             _fs = new FileStream(path, FileMode.Open, options.FileAccess, options.FileShare,
                                  options.FileBufferSize, FileOptions.SequentialScan);
 
-            // Read enough of the database definition page (page 0)
-            var hdr = new byte[0x80];
-            _fs.Read(hdr, 0, hdr.Length);
+            // Page 0 whole, not just the 0x80-byte header: an encrypted ACE database keeps this
+            // page in plain text and stores its encryption descriptor further in, past 0x2A0.
+            var hdr = new byte[Math.Min(4096, Math.Max(0x80, _fs.Length))];
+            ReadFully(hdr, hdr.Length);
 
             // Offset 0x14: 0 = Jet3, ≥ 1 = Jet4+
             byte ver = hdr[0x14];
@@ -274,18 +281,19 @@ namespace JetDatabaseReader
                 _varLenFldSz    =  1;
             }
 
-            // Page 2 always holds the MSysObjects table definition. If it is not a TDEF page the
-            // page bodies are unreadable, which in practice means ACE "Encrypt with Password".
-            // Without this, an encrypted database opened cleanly and then reported zero tables.
-            var catalogHeader = new byte[1];
-            _fs.Seek(2L * _pgSz, SeekOrigin.Begin);
-            if (_fs.Read(catalogHeader, 0, 1) == 1 && catalogHeader[0] != 0x02)
+            // Page 2 always holds the MSysObjects table definition, so it doubles as the check
+            // that pages are readable at all. When it is not a TDEF the pages are encrypted.
+            if (!IsCatalogPageReadable())
             {
-                throw new NotSupportedException(
-                    "This database's pages are encrypted (Access 'Encrypt with Password'), which " +
-                    "this library cannot read. AccessReaderOptions.Password only covers the older " +
-                    "Jet4 (.mdb) database password, which does not encrypt page data. " +
-                    "Remove the encryption in Microsoft Access (File > Info > Decrypt Database) and try again.");
+                SetUpDecryption(hdr, options.Password);
+
+                if (!IsCatalogPageReadable())
+                {
+                    throw new NotSupportedException(
+                        "This database's pages are encrypted and could not be decrypted. " +
+                        "Supply the password via AccessReaderOptions.Password, or remove the " +
+                        "encryption in Microsoft Access (File > Info > Decrypt Database).");
+                }
             }
 
             if (options.ValidateOnOpen)
@@ -299,6 +307,66 @@ namespace JetDatabaseReader
         /// control rather than encryption — the page data is stored in plain text either way.
         /// </summary>
         public bool IsPasswordProtected => _isPasswordProtected;
+
+        /// <summary>True when the pages are encrypted and are being decrypted as they are read.</summary>
+        public bool IsEncrypted => _crypto != null;
+
+        /// <summary>Reads <paramref name="count"/> bytes from the current position, tolerating short reads.</summary>
+        private void ReadFully(byte[] buffer, int count)
+        {
+            int read = 0;
+            while (read < count)
+            {
+                int got = _fs.Read(buffer, read, count - read);
+                if (got == 0) break;
+                read += got;
+            }
+        }
+
+        /// <summary>True when page 2 decodes to a TDEF, which is what an unencrypted database gives.</summary>
+        private bool IsCatalogPageReadable()
+        {
+            var page = new byte[_pgSz];
+            _fs.Seek(2L * _pgSz, SeekOrigin.Begin);
+            ReadFully(page, _pgSz);
+
+            _crypto?.DecryptSegment(page, _pgSz, 2 + _segmentOffset);
+            return page[0] == 0x02;
+        }
+
+        /// <summary>
+        /// Derives the page key from the password, then works out how page numbers map onto
+        /// encryption segments by decrypting page 2 and seeing which mapping yields a TDEF.
+        /// The specification numbers segments within an encrypted stream; which page that stream
+        /// starts at is exactly the sort of detail worth confirming rather than assuming.
+        /// </summary>
+        private void SetUpDecryption(byte[] page0, string password)
+        {
+            string descriptor = AgileEncryption.FindDescriptor(page0);
+            if (descriptor == null) return;   // encrypted by some other scheme, or not at all
+
+            if (string.IsNullOrEmpty(password))
+                throw new InvalidOperationException(
+                    "This database is encrypted. Supply the password via AccessReaderOptions.Password.");
+
+            AgileEncryption crypto = AgileEncryption.Create(descriptor, password);
+            if (crypto == null)
+                throw new InvalidOperationException("The supplied password does not match this database's password.");
+
+            _crypto = crypto;
+
+            foreach (int candidate in new[] { 0, -1 })
+            {
+                _segmentOffset = candidate;
+                if (IsCatalogPageReadable()) return;
+            }
+
+            _crypto = null;
+            _segmentOffset = 0;
+            throw new NotSupportedException(
+                "The password was accepted but the pages did not decrypt to a readable catalog. " +
+                "This database may use a page layout this library does not handle.");
+        }
 
         /// <summary>
         /// Opens a JET database file and returns a new AccessReader instance.
@@ -451,6 +519,9 @@ namespace JetDatabaseReader
             // A freshly allocated array was zero-filled; a reused one is not. Clear the tail so a
             // short read at end-of-file cannot expose the previous page's bytes.
             if (read < _pgSz) Array.Clear(buf, read, _pgSz - read);
+
+            // Page 0 carries the header and the encryption descriptor and is never encrypted.
+            if (_crypto != null && n > 0) _crypto.DecryptSegment(buf, _pgSz, n + _segmentOffset);
         }
 
         /// <summary>

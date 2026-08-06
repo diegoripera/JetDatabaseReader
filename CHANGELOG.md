@@ -177,6 +177,33 @@ of the seventeenth character. It behaved like a flag only because an unset passw
 mask's own value there, and would have misreported for passwords whose seventeenth character
 cleared those bits.
 
+### 🚧 ACE encryption (`.accdb`) — key derivation done, page decryption not
+
+Partial. The scheme is identified and the hard cryptography works; one derivation step remains.
+
+The fixture uses **ECMA-376 agile encryption**: AES-256-CBC, SHA-512, spin count 100 000, with the
+descriptor sitting in plain text in page 0. `AgileEncryption` implements the MS-OFFCRYPTO key
+derivation — iterated password hashing, the verifier, and unwrapping the package key.
+
+Two things are established rather than assumed:
+
+- **The password is right.** The format carries a verifier, so passing it is proof, not inference.
+  Access truncates the password to 20 characters here as well, so a longer one is retried
+  truncated — found by testing candidates against the verifier.
+- **The package key is right.** Pages 2, 3, and 4 decrypt byte-identical to the unencrypted twin
+  from offset 16 onward. In CBC a wrong IV corrupts only the first block, so a correct tail proves
+  the key while isolating the fault to the IV.
+
+What is unresolved is how each page's IV is derived. It is not the OOXML segment rule
+`H(salt ‖ LE32(index))` (swept over 300 000 indices, several hash and byte-order variants), not the
+salt itself, not chained CBC from the previous page, and it is not stored anywhere in the file.
+Page numbers map 1:1 to segments, which the matching tails confirm.
+
+Until that is settled, opening an encrypted `.accdb` with the correct password throws a
+`NotSupportedException` saying the password was accepted but the pages did not decrypt — distinct
+from the wrong-password error. Two tests carrying the end-to-end assertions are present and
+skipped, ready to run when the derivation is found.
+
 ### 🐛 Encrypted `.accdb` reported an empty database instead of an error
 
 ACE "Encrypt with Password" encrypts the page bodies. The old flag check was skipped for ACE files,
