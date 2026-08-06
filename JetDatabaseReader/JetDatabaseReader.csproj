@@ -25,4 +25,12 @@
   <ItemGroup>
     <PackageReference Include="System.Text.Encoding.CodePages" Version="8.0.0" />
   </ItemGroup>
+
+  <!-- Lets the tests cover internal parsing helpers directly, so logic that has no public
+       entry point (connection strings, the Jet password field) is still verifiable. -->
+  <ItemGroup>
+    <AssemblyAttribute Include="System.Runtime.CompilerServices.InternalsVisibleTo">
+      <_Parameter1>JetDatabaseReader.Tests</_Parameter1>
+    </AssemblyAttribute>
+  </ItemGroup>
 </Project>

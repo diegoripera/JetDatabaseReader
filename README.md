@@ -341,8 +341,31 @@ catch (ObjectDisposedException) { /* reader already disposed */ }
 | ✅ Jet4 database password (`.mdb`) | Supply it via `AccessReaderOptions.Password` |
 | ❌ ACE encryption (`.accdb`) | "Encrypt with Password" really encrypts the pages — decrypt in Access first |
 | ❌ Attachment fields (0x11) | Rare type added in Access 2007 |
-| ❌ Linked tables | Only local tables are listed |
+| ⚠️ Linked tables | Listed with their source; readable only when the source is another Access file |
 | ❌ Write operations | Read-only library |
+
+### Linked tables
+
+A linked table appears in the database but its rows live elsewhere, so it is reported separately
+from `ListTables()` — asking to read one as a local table would return nothing:
+
+```csharp
+foreach (LinkedTable link in reader.GetLinkedTables())
+{
+    Console.WriteLine($"{link.Name} -> {link.Kind} {link.SourcePath ?? link.ConnectionString}");
+
+    if (link.IsAccessDatabase)
+    {
+        using AccessReader source = reader.OpenLinkedTableSource(link);
+        foreach (object[] row in source.StreamRows(link.ForeignName)) { /* ... */ }
+    }
+}
+```
+
+Links to another Access database can be followed. ODBC links cannot — that needs a driver, which is
+the dependency this library exists to avoid — and Excel or text sources are not JET databases; for
+those, `ConnectionString` tells you what to open. Access stores the path as it was when the link
+was made, so a link can point at a drive or share that no longer resolves.
 
 ### Password-protected databases
 

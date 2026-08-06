@@ -59,8 +59,10 @@ namespace JetDatabaseReader
         private const byte FLAG_FIXED = 0x01;
 
         // Catalog (MSysObjects) constants
-        private const int  OBJ_TABLE     = 1;
-        private const uint SYSTABLE_MASK = 0x80000002U;
+        private const int  OBJ_TABLE        = 1;  // local table
+        private const int  OBJ_LINKED_ODBC  = 4;  // linked through an ODBC driver
+        private const int  OBJ_LINKED       = 6;  // linked to a file: Access, Excel, text, ...
+        private const uint SYSTABLE_MASK    = 0x80000002U;
 
         // ── Format-specific offsets ───────────────────────────────────────
 
@@ -104,6 +106,9 @@ namespace JetDatabaseReader
         /// <summary>Guards the non-atomic Seek+Read pair against the shared <see cref="_fs"/>.</summary>
         private readonly object _ioLock = new object();
         private volatile List<CatalogEntry> _catalogCache;
+
+        /// <summary>Linked tables found in the same catalog scan. Published before the catalog.</summary>
+        private volatile List<LinkedTable> _linkedCache;
         private volatile LruCache<long, byte[]> _pageCache;
 
         /// <summary>
@@ -373,6 +378,7 @@ namespace JetDatabaseReader
             lock (_catalogLock)
             {
                 _catalogCache = null;
+                _linkedCache = null;
                 LastDiagnostics = string.Empty;
             }
             lock (_indexLock)
@@ -685,10 +691,12 @@ namespace JetDatabaseReader
                     string.Join(", ", msys.Columns.ConvertAll(c => $"{c.Name}[0x{c.Type:X2}]")));
 
                 // Case-insensitive column lookup — column names vary slightly across Access versions
-                int idxId    = msys.Columns.FindIndex(c => string.Equals(c.Name, "Id",    StringComparison.OrdinalIgnoreCase));
-                int idxName  = msys.Columns.FindIndex(c => string.Equals(c.Name, "Name",  StringComparison.OrdinalIgnoreCase));
-                int idxType  = msys.Columns.FindIndex(c => string.Equals(c.Name, "Type",  StringComparison.OrdinalIgnoreCase));
-                int idxFlags = msys.Columns.FindIndex(c => string.Equals(c.Name, "Flags", StringComparison.OrdinalIgnoreCase));
+                int idxId      = msys.Columns.FindIndex(c => string.Equals(c.Name, "Id",          StringComparison.OrdinalIgnoreCase));
+                int idxName    = msys.Columns.FindIndex(c => string.Equals(c.Name, "Name",        StringComparison.OrdinalIgnoreCase));
+                int idxType    = msys.Columns.FindIndex(c => string.Equals(c.Name, "Type",        StringComparison.OrdinalIgnoreCase));
+                int idxFlags   = msys.Columns.FindIndex(c => string.Equals(c.Name, "Flags",       StringComparison.OrdinalIgnoreCase));
+                int idxConnect = msys.Columns.FindIndex(c => string.Equals(c.Name, "Connect",     StringComparison.OrdinalIgnoreCase));
+                int idxForeign = msys.Columns.FindIndex(c => string.Equals(c.Name, "ForeignName", StringComparison.OrdinalIgnoreCase));
 
                 if (idxName < 0 || idxType < 0)
                 {
@@ -698,10 +706,12 @@ namespace JetDatabaseReader
                     return _catalogCache;
                 }
 
-                var result    = new List<CatalogEntry>();
-                long totPages = _fs.Length / _pgSz;
-                int  catPages = 0;
-                int  allRows  = 0;
+                var result       = new List<CatalogEntry>();
+                var linked       = new List<LinkedTable>();
+                var objectTypes  = new Dictionary<int, int>();
+                long totPages    = _fs.Length / _pgSz;
+                int  catPages    = 0;
+                int  allRows     = 0;
 
                 // This pass already touches every page header, so recording each data page's
                 // owning TDEF costs nothing extra and saves every later read a whole-file scan.
@@ -739,14 +749,31 @@ namespace JetDatabaseReader
                         string nameStr  = SafeGet(catRow, idxName);
                         string flagsStr = SafeGet(catRow, idxFlags);
 
-                        if (!int.TryParse(typeStr, out int objType) || objType != OBJ_TABLE)
-                            continue;
+                        if (!int.TryParse(typeStr, out int objType)) continue;
+
+                        objectTypes.TryGetValue(objType, out int seen);
+                        objectTypes[objType] = seen + 1;
+
+                        bool isLinked = objType == OBJ_LINKED || objType == OBJ_LINKED_ODBC;
+                        if (objType != OBJ_TABLE && !isLinked) continue;
 
                         long.TryParse(flagsStr, out long flagsLong);
                         if (((uint)flagsLong & SYSTABLE_MASK) != 0)
                             continue;
 
                         if (string.IsNullOrEmpty(nameStr)) continue;
+
+                        if (isLinked)
+                        {
+                            // The rows live elsewhere, so there is no TDEF page to record — only
+                            // where to find them.
+                            linked.Add(LinkedTableParser.Parse(
+                                nameStr,
+                                SafeGet(catRow, idxForeign),
+                                SafeGet(catRow, idxConnect),
+                                objType == OBJ_LINKED_ODBC));
+                            continue;
+                        }
 
                         long tdefPage = 0;
                         if (idxId >= 0)
@@ -760,7 +787,20 @@ namespace JetDatabaseReader
                     }
                 }
 
-                diag.AppendLine($"Catalog pages: {catPages}  Total rows scanned: {allRows}  User tables: {result.Count}");
+                diag.AppendLine($"Catalog pages: {catPages}  Total rows scanned: {allRows}  " +
+                                $"User tables: {result.Count}  Linked tables: {linked.Count}");
+
+                var types = new List<int>(objectTypes.Keys);
+                types.Sort();
+                var typeParts = new List<string>(types.Count);
+                foreach (int t in types) typeParts.Add($"{t}:{objectTypes[t]}");
+                diag.AppendLine($"Catalog object types (type:count): {string.Join(", ", typeParts)}");
+
+                if (DiagnosticsEnabled)
+                {
+                    foreach (LinkedTable l in linked)
+                        diag.AppendLine($"  LINK {l}  connect='{l.ConnectionString}'");
+                }
                 int totalRuns = 0;
                 foreach (var kv in index) totalRuns += kv.Value.Count;
                 diag.AppendLine($"Page index: {index.Count} distinct owners, {totalRuns} runs over {totPages} pages");
@@ -782,6 +822,7 @@ namespace JetDatabaseReader
                 // exit for concurrent callers, and they consult the index right after.
                 Interlocked.Exchange(ref _indexedPages, totPages);
                 _pageIndex = trimmed;
+                _linkedCache = linked;
                 _catalogCache = result;
                 return _catalogCache;
             }
@@ -986,6 +1027,54 @@ namespace JetDatabaseReader
                 TableName  = entry.Name,
                 TableCount = tables.Count
             };
+        }
+
+        /// <summary>
+        /// Returns the tables that are linked rather than stored here, with the connection string
+        /// and the name each has in its source.
+        ///
+        /// These are deliberately absent from <see cref="ListTables"/>: their rows are not in this
+        /// file, so asking to read one would either fail or silently return nothing. Use
+        /// <see cref="OpenLinkedTableSource"/> for a link that points at another Access database.
+        /// </summary>
+        public List<LinkedTable> GetLinkedTables()
+        {
+            ThrowIfDisposed();
+            GetUserTables();   // the catalog scan finds both in one pass
+            return new List<LinkedTable>(_linkedCache ?? new List<LinkedTable>());
+        }
+
+        /// <summary>
+        /// Opens the Access database a linked table points at, so its rows can be read with
+        /// <c>reader.StreamRows(link.ForeignName)</c>.
+        ///
+        /// Only for links to another Access file. An ODBC link needs a driver, which is the
+        /// dependency this library exists to avoid, and Excel or text sources are not JET
+        /// databases — for those, <see cref="LinkedTable.ConnectionString"/> tells you what to open.
+        /// </summary>
+        /// <param name="link">A link obtained from <see cref="GetLinkedTables"/>.</param>
+        /// <param name="options">Options for the source database. Its own password, if any, goes here.</param>
+        /// <exception cref="NotSupportedException">The link does not point at an Access database.</exception>
+        /// <exception cref="FileNotFoundException">The source file is missing or unreachable.</exception>
+        public AccessReader OpenLinkedTableSource(LinkedTable link, AccessReaderOptions options = null)
+        {
+            ThrowIfDisposed();
+            Guard.NotNull(link, nameof(link));
+
+            if (!link.IsAccessDatabase)
+                throw new NotSupportedException(
+                    $"'{link.Name}' is a {link.Kind} link, not a link to an Access database. " +
+                    $"Its connection string is '{link.ConnectionString}'.");
+
+            // Access stores the path as it was when the link was made, so it is regularly a UNC
+            // path or a drive letter that no longer resolves on this machine.
+            if (!File.Exists(link.SourcePath))
+                throw new FileNotFoundException(
+                    $"The database '{link.Name}' is linked to was not found at '{link.SourcePath}'. " +
+                    $"Linked paths are stored as they were when the link was created.",
+                    link.SourcePath);
+
+            return Open(link.SourcePath, options);
         }
 
         /// <summary>Returns the names of all user tables in the database.</summary>

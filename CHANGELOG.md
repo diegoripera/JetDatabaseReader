@@ -134,6 +134,23 @@ three. Appended pages were already picked up automatically; this covers pages re
 - **Dead code removed** — `TypedValueParser` had no remaining callers after typed decoding stopped
   going through strings.
 
+### ✨ Linked tables
+
+`GetLinkedTables()` returns the tables whose rows live somewhere else, each with its connection
+string, the name it has in the source, and a parsed `Kind` and `SourcePath`. `MSysObjects` object
+types 4 (ODBC) and 6 (file link) were previously discarded along with everything else that was not
+a local table.
+
+They stay out of `ListTables()` on purpose: the rows are not in this file, so reading one as a
+local table would quietly return nothing. `OpenLinkedTableSource(link)` opens the source when it is
+another Access database. ODBC links cannot be followed — that needs a driver, which is the
+dependency this library exists to avoid.
+
+> **Verification gap.** None of the available test databases contains a linked table, so the
+> connection-string parsing and the open path are covered by unit tests against the formats Access
+> writes, but the catalog-level detection of object types 4 and 6 has not been exercised against a
+> real linked database. Treat that part as unproven until a fixture exists.
+
 ### ✨ Jet4 database passwords (`.mdb`)
 
 `AccessReaderOptions.Password` opens an `.mdb` that has a database password set, and
