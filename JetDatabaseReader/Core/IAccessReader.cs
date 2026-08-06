@@ -107,9 +107,46 @@ namespace JetDatabaseReader
         DataTable ReadTableAsStringDataTable(string tableName = null, IProgress<int> progress = null);
 
         /// <summary>
+        /// Drops the catalog, page index, and page cache so the next call re-reads from disk.
+        /// Use when another process may have modified the database under a long-lived reader.
+        /// </summary>
+        void Refresh();
+
+        /// <summary>Returns the column names of the specified table, in table order.</summary>
+        List<string> GetColumnNames(string tableName);
+
+        /// <summary>
         /// Returns rich metadata for all columns in the specified table.
         /// </summary>
         List<ColumnMetadata> GetColumnMetadata(string tableName);
+
+        /// <summary>
+        /// Yields only <paramref name="columns"/>, in the order given, as typed object arrays.
+        /// Unselected columns are never decoded — for MEMO and OLE columns that also means their
+        /// LVAL pages are never read.
+        /// </summary>
+        IEnumerable<object[]> StreamRows(string tableName, IReadOnlyList<string> columns, IProgress<int> progress);
+
+        /// <summary>
+        /// Yields only <paramref name="columns"/>, in the order given, as string arrays.
+        /// </summary>
+        IEnumerable<string[]> StreamRowsAsStrings(string tableName, IReadOnlyList<string> columns, IProgress<int> progress);
+
+        /// <summary>
+        /// Reads only <paramref name="columns"/> into a DataTable with native CLR column types.
+        /// </summary>
+        DataTable ReadTable(string tableName, IReadOnlyList<string> columns, IProgress<int> progress);
+
+        /// <summary>
+        /// Reads only <paramref name="columns"/> into a DataTable of string columns.
+        /// </summary>
+        DataTable ReadTableAsStringDataTable(string tableName, IReadOnlyList<string> columns, IProgress<int> progress);
+
+        /// <summary>
+        /// Opens a forward-only cursor over the table — the constant-memory path for feeding
+        /// <c>SqlBulkCopy</c>, <c>DataTable.Load</c>, or a streaming exporter.
+        /// </summary>
+        AccessDataReader CreateDataReader(string tableName, IReadOnlyList<string> columns = null);
 
         /// <summary>
         /// Returns statistical information about the database.

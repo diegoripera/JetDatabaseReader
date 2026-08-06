@@ -145,6 +145,37 @@ foreach (string[] row in reader.StreamRowsAsStrings("BigTable"))
 
 Null values in typed rows surface as `DBNull.Value`.
 
+### Column projection — read only what you need
+
+Unselected columns are never decoded. For MEMO and OLE columns that also means their LVAL pages
+are never read, so projecting away blob columns cuts both time and memory:
+
+```csharp
+foreach (object[] row in reader.StreamRows("BigTable", new[] { "Id", "Total" }, null))
+{
+    int     id    = (int)row[0];   // indexes follow the projection, not the table
+    decimal total = (decimal)row[1];
+}
+```
+
+Also available on `ReadTable`, `ReadTableAsStringDataTable`, and the fluent `Query(...).Select(...)`.
+
+### Constant-memory export — `IDataReader`
+
+`ReadTable` materialises the whole table: reading a 77 MB database costs about 165 MB of retained
+heap. When you only need to move the data somewhere else, use the cursor — it holds one row at a
+time, so memory stays flat no matter how large the table is:
+
+```csharp
+using var cursor = reader.CreateDataReader("BigTable");
+
+using var bulk = new SqlBulkCopy(connectionString) { DestinationTableName = "dbo.BigTable" };
+bulk.WriteToServer(cursor);          // streams; never materialises the table
+```
+
+It works anywhere `IDataReader` is accepted — `DataTable.Load(cursor)`, CSV writers, and so on.
+Per the `IDataReader` contract, values are valid only until the next `Read()`.
+
 ---
 
 ## Fluent Query API
@@ -224,16 +255,69 @@ Console.WriteLine($"Cache hit: {s.PageCacheHitRate}%");
 ```csharp
 var options = new AccessReaderOptions
 {
-    PageCacheSize            = 512,    // pages in LRU cache (default: 256)
-    ParallelPageReadsEnabled = true,   // parallel I/O (default: false)
-    DiagnosticsEnabled       = false,  // verbose logging (default: false)
-    ValidateOnOpen           = true,   // format check on open (default: true)
-    FileAccess               = FileAccess.Read,   // default
-    FileShare                = FileShare.Read,    // default: others may read, writes blocked
-    // FileShare             = FileShare.ReadWrite // use when Access has the file open
+    PageCacheSize      = 512,    // pages in LRU cache (default: 256)
+    FileBufferSize     = 64*1024,// FileStream buffer (default: 65536)
+    DiagnosticsEnabled = false,  // verbose logging (default: false)
+    ValidateOnOpen     = true,   // format check on open (default: true)
+    OleObjectMode      = OleObjectMode.Placeholder,  // skip OLE payloads (default: DataUri)
+    FileAccess         = FileAccess.Read,       // default
+    FileShare          = FileShare.ReadWrite,   // default: another app may hold the file open
 };
 using var reader = AccessReader.Open("database.mdb", options);
 ```
+
+`OleObjectMode.Placeholder` makes OLE columns read as the literal `"(OLE)"` without decoding the
+payload — the blob's LVAL pages are never read and no base64 string is built. Use it when scanning
+a table whose attachments you do not need; `DataUri` (the default) returns a `data:` URI and costs
+the blob plus a string about 1.33x its size.
+
+> `ParallelPageReadsEnabled` exists on the options and the reader but currently has no effect —
+> nothing reads it. It is kept for binary compatibility.
+
+---
+
+## Concurrency & hosting (IIS, Azure App Service)
+
+### What is safe
+
+| Scenario | Safe | Notes |
+|----------|------|-------|
+| One reader shared across threads, independent operations | ✅ | Reads against the shared file handle are serialised internally |
+| Several readers in one process, same file | ✅ | Each owns its own file handle |
+| Several **processes** reading the same file | ✅ | IIS web gardens, multiple App Service instances |
+| Opening while Microsoft Access holds the file | ✅ | Default `FileShare.ReadWrite` |
+| One `IEnumerable` from `StreamRows` enumerated by several threads | ❌ | Enumerate it on one thread, like any `IEnumerable` |
+| One `AccessDataReader` used by several threads | ❌ | One cursor per thread — its row buffer is reused |
+
+### Caching a reader
+
+Opening a database scans the catalog once, so keeping a reader alive is worth it — and it is cheap:
+a reader over a 2 GB database costs about **140 KB** resident, and about **85 KB** over a 77 MB one
+(most of it the 64 KB `FileBufferSize`, which you can lower). Registering one per database as a
+singleton and serving concurrent requests from it is a supported pattern.
+
+```csharp
+services.AddSingleton(_ => AccessReader.Open(@"D:\data\catalog.accdb"));
+```
+
+### Staleness
+
+The catalog, page index, and page cache are read once and never re-validated. Pages **appended**
+by another process are picked up automatically, but pages **rewritten in place** are not — a
+long-lived reader would keep serving the old contents. Call `Refresh()` when you know the file
+changed:
+
+```csharp
+reader.Refresh();   // drops catalog, page index, and page cache
+```
+
+If the database is rewritten frequently, prefer opening a reader per request over caching one.
+
+### Memory
+
+`ReadTable` and `ReadAllTables` materialise everything: a 77 MB database retains about 165 MB as a
+`DataTable`. On a memory-constrained plan use `StreamRows` or `CreateDataReader`, which hold one
+row at a time, and project away columns you do not need.
 
 ---
 

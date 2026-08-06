@@ -179,24 +179,32 @@ namespace JetDatabaseReader.Tests
             string path = TestDatabases.LargeFile;
             if (!TestDatabases.IsReadable(path)) return; // skip if not present or encrypted
 
-            long before = GC.GetTotalMemory(forceFullCollection: true);
-
             using var reader = TestDatabases.Open(path, new AccessReaderOptions { PageCacheSize = 256 });
             string table = reader.GetTableStats().FirstOrDefault(s => s.RowCount > 0).Name
                            ?? reader.ListTables()[0];
+
+            // GC.GetTotalMemory is process-wide and xUnit runs test classes in parallel, so a
+            // before/after delta around the whole enumeration also counts whatever other tests
+            // are holding — several of them read this same 2 GB file. Measure the GROWTH between
+            // two points inside one enumeration instead: concurrent noise affects both readings,
+            // and "90 000 more rows costs no more memory" is the invariant this test is about.
             int count = 0;
+            long at10k = 0;
 
             foreach (object[] _ in reader.StreamRows(table))
             {
                 count++;
-                if (count >= 100_000) break; // process first 100 K rows
+                if (count == 10_000) at10k = GC.GetTotalMemory(forceFullCollection: true);
+                if (count >= 100_000) break;
             }
 
-            long after   = GC.GetTotalMemory(forceFullCollection: true);
-            long deltaMb = (after - before) / (1024 * 1024);
+            if (count < 20_000) return; // table too small for the comparison to mean anything
 
-            deltaMb.Should().BeLessThan(200,
-                because: "streaming should not load the whole file into memory");
+            long at100k  = GC.GetTotalMemory(forceFullCollection: true);
+            long growthMb = (at100k - at10k) / (1024 * 1024);
+
+            growthMb.Should().BeLessThan(100,
+                because: "streaming must not accumulate rows — 10x more rows should not cost 10x memory");
         }
 
         [Fact]

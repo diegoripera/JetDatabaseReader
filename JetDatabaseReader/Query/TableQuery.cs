@@ -16,6 +16,7 @@ namespace JetDatabaseReader
         private readonly AccessReader _reader;
         private readonly string _tableName;
         private int? _limit;
+        private string[] _columns;
         private Func<object[], bool> _typedFilter;
         private Func<string[], bool> _stringFilter;
 
@@ -49,6 +50,33 @@ namespace JetDatabaseReader
             return this;
         }
 
+        // ── Projection ────────────────────────────────────────────────────
+
+        /// <summary>
+        /// Restricts the query to the named columns, in the order given.
+        /// Columns that are not selected are never decoded, so projecting away wide TEXT, MEMO,
+        /// or OLE columns avoids both their allocations and — for MEMO/OLE — the LVAL page reads
+        /// they would otherwise trigger.
+        ///
+        /// The predicate passed to <see cref="Where"/> receives the projected row, so its indexes
+        /// refer to the <paramref name="columns"/> order, not the table's.
+        /// </summary>
+        /// <param name="columns">Column names, case-insensitive.</param>
+        /// <exception cref="ArgumentException">A requested column does not exist in the table.</exception>
+        public TableQuery Select(params string[] columns)
+        {
+            Guard.NotNull(columns, nameof(columns));
+            if (columns.Length == 0)
+                throw new ArgumentException("Select requires at least one column.", nameof(columns));
+
+            _columns = columns;
+            return this;
+        }
+
+        /// <summary>The column names this query returns, in output order.</summary>
+        public IReadOnlyList<string> Columns =>
+            _columns ?? (IReadOnlyList<string>)_reader.GetColumnNames(_tableName);
+
         // ── Limit ─────────────────────────────────────────────────────────
 
         /// <summary>
@@ -69,7 +97,7 @@ namespace JetDatabaseReader
         /// </summary>
         public IEnumerable<object[]> Execute()
         {
-            IEnumerable<object[]> rows = _reader.StreamRows(_tableName);
+            IEnumerable<object[]> rows = _reader.StreamRows(_tableName, _columns, null);
 
             if (_typedFilter != null)
                 rows = rows.Where(_typedFilter);
@@ -105,7 +133,7 @@ namespace JetDatabaseReader
         /// </summary>
         public IEnumerable<string[]> ExecuteAsStrings()
         {
-            IEnumerable<string[]> rows = _reader.StreamRowsAsStrings(_tableName);
+            IEnumerable<string[]> rows = _reader.StreamRowsAsStrings(_tableName, _columns, null);
 
             if (_stringFilter != null)
                 rows = rows.Where(_stringFilter);

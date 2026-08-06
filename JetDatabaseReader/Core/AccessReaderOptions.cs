@@ -19,6 +19,21 @@ namespace JetDatabaseReader
         /// <summary>When true, validates the database format on open. Default: true.</summary>
         public bool ValidateOnOpen { get; set; } = true;
 
+        /// <summary>
+        /// How OLE Object columns are rendered. Default: <see cref="OleObjectMode.DataUri"/>.
+        /// Set to <see cref="OleObjectMode.Placeholder"/> when the payloads are not needed —
+        /// it skips both the base64 encoding and the LVAL page reads behind it.
+        /// </summary>
+        public OleObjectMode OleObjectMode { get; set; } = OleObjectMode.DataUri;
+
+        /// <summary>
+        /// FileStream buffer size in bytes. Default: 65536.
+        /// Reads are one page at a seeked offset, so a buffer larger than the page size lets a
+        /// front-to-back scan serve most pages without a syscall. Lower it to trade scan speed
+        /// for a smaller per-reader footprint.
+        /// </summary>
+        public int FileBufferSize { get; set; } = 64 * 1024;
+
         /// <summary>File access mode. Default: Read.</summary>
         public FileAccess FileAccess { get; set; } = FileAccess.Read;
 

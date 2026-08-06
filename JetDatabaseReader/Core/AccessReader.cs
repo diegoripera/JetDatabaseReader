@@ -99,8 +99,24 @@ namespace JetDatabaseReader
         private readonly int _codePage;
         private readonly object _cacheLock = new object();
         private readonly object _catalogLock = new object();
+        private readonly object _indexLock = new object();
+
+        /// <summary>Guards the non-atomic Seek+Read pair against the shared <see cref="_fs"/>.</summary>
+        private readonly object _ioLock = new object();
         private volatile List<CatalogEntry> _catalogCache;
         private volatile LruCache<long, byte[]> _pageCache;
+
+        /// <summary>
+        /// Maps a table's TDEF page number to the ascending runs of data pages owned by it.
+        /// Built for free during the single catalog scan in <see cref="GetUserTables"/>, which
+        /// already reads every page header. Without it, every read method has to walk the whole
+        /// file to find its own pages — so reading N tables costs N whole-file scans.
+        /// </summary>
+        private volatile Dictionary<long, PageRun[]> _pageIndex;
+
+        /// <summary>Number of pages covered by <see cref="_pageIndex"/>. Read via Interlocked.</summary>
+        private long _indexedPages;
+
         private bool _disposed;
         private long _cacheHits;
         private long _cacheMisses;
@@ -113,6 +129,11 @@ namespace JetDatabaseReader
 
         /// <summary>When true, uses parallel processing for reading multiple pages. Can improve performance for large tables. Default: false.</summary>
         public bool ParallelPageReadsEnabled { get; set; }
+
+        /// <summary>
+        /// How OLE Object columns are rendered. Default: <see cref="OleObjectMode.DataUri"/>.
+        /// </summary>
+        public OleObjectMode OleObjectMode { get; set; } = OleObjectMode.DataUri;
 
         // ── Constructor ───────────────────────────────────────────────────
 
@@ -133,9 +154,20 @@ namespace JetDatabaseReader
             DiagnosticsEnabled = options.DiagnosticsEnabled;
             PageCacheSize = options.PageCacheSize;
             ParallelPageReadsEnabled = options.ParallelPageReadsEnabled;
+            OleObjectMode = options.OleObjectMode;
 
-            _fs = new FileStream(path, FileMode.Open, options.FileAccess, options.FileShare);
-
+            // Two deliberate choices here:
+            //
+            // bufferSize — every read is exactly one page at a seeked offset. With the default
+            // 4 KB buffer FileStream bypasses buffering entirely and issues one syscall per page.
+            // A larger buffer lets a front-to-back scan serve most pages from memory, because
+            // FileStream keeps its read buffer across a Seek that lands inside it. At 64 KB that
+            // is one syscall per 16 pages instead of one per page.
+            //
+            // SequentialScan — tells the OS cache manager to read ahead and drop pages behind us,
+            // which is what a full-file scan wants.
+            _fs = new FileStream(path, FileMode.Open, options.FileAccess, options.FileShare,
+                                 options.FileBufferSize, FileOptions.SequentialScan);
 
             // Read enough of the database definition page (page 0)
             var hdr = new byte[0x80];
@@ -283,10 +315,51 @@ namespace JetDatabaseReader
                 {
                     _catalogCache?.Clear();
                 }
+                lock (_indexLock)
+                {
+                    _pageIndex = null;
+                    _indexedPages = 0;
+                }
             }
             finally
             {
                 _disposed = true;
+            }
+        }
+
+        /// <summary>
+        /// Drops the catalog, page index, and page cache so the next call re-reads them from disk.
+        ///
+        /// The reader caches aggressively and never re-validates, which is right for a file nobody
+        /// else is writing. The default <see cref="FileShare.ReadWrite"/> does allow another
+        /// process — Microsoft Access, an import job — to modify the database underneath a
+        /// long-lived reader, and those caches would then serve stale data indefinitely. Call this
+        /// when you know the file changed, or drop the reader and open a new one.
+        ///
+        /// Appended pages are picked up automatically and do not need a refresh; this is for
+        /// pages that were rewritten in place.
+        /// </summary>
+        public void Refresh()
+        {
+            ThrowIfDisposed();
+
+            lock (_catalogLock)
+            {
+                _catalogCache = null;
+                LastDiagnostics = string.Empty;
+            }
+            lock (_indexLock)
+            {
+                _pageIndex = null;
+                Interlocked.Exchange(ref _indexedPages, 0);
+            }
+            lock (_cacheLock)
+            {
+                _pageCache?.Clear();
+            }
+            lock (_tdefLock)
+            {
+                _tdefCache.Clear();
             }
         }
 
@@ -312,17 +385,67 @@ namespace JetDatabaseReader
         private byte[] ReadPage(long n)
         {
             var buf = new byte[_pgSz];
-            _fs.Seek(n * _pgSz, SeekOrigin.Begin);
-            // FileStream.Read is not guaranteed to return all bytes in one call
-            int read = 0;
-            while (read < _pgSz)
-            {
-                int got = _fs.Read(buf, read, _pgSz - read);
-                if (got == 0) break;
-                read += got;
-            }
+            ReadPageInto(n, buf);
             return buf;
         }
+
+        /// <summary>
+        /// Reads page <paramref name="n"/> into <paramref name="buf"/>, which must be exactly
+        /// <see cref="_pgSz"/> bytes — MEMO/OLE decoding uses <c>buf.Length</c> as a bound, so an
+        /// oversized buffer would widen those checks and let stale bytes through.
+        /// </summary>
+        private void ReadPageInto(long n, byte[] buf)
+        {
+            int read = 0;
+
+            // Seek and Read are two calls against one shared file position. Without this lock two
+            // threads using the same reader interleave them and each gets bytes from the other's
+            // page — silently, as plausible-looking garbage. Caching one open reader and serving
+            // concurrent requests from it is the obvious thing to do in a web app, so the pair has
+            // to be atomic. An uncontended lock costs far less than the read it guards.
+            lock (_ioLock)
+            {
+                _fs.Seek(n * _pgSz, SeekOrigin.Begin);
+                // FileStream.Read is not guaranteed to return all bytes in one call
+                while (read < _pgSz)
+                {
+                    int got = _fs.Read(buf, read, _pgSz - read);
+                    if (got == 0) break;
+                    read += got;
+                }
+            }
+
+            // A freshly allocated array was zero-filled; a reused one is not. Clear the tail so a
+            // short read at end-of-file cannot expose the previous page's bytes.
+            if (read < _pgSz) Array.Clear(buf, read, _pgSz - read);
+        }
+
+        /// <summary>
+        /// Reads a page during a front-to-back scan. Returns the cached copy when one exists,
+        /// otherwise fills <paramref name="scratch"/> and returns that.
+        ///
+        /// Deliberately does NOT populate the cache: a sequential scan touches every page once,
+        /// so caching them evicts the LVAL and TDEF pages that do get reused, and yields nothing
+        /// in return. The caller must not retain the returned array beyond the current page.
+        /// </summary>
+        private byte[] ReadPageForScan(long n, byte[] scratch)
+        {
+            ThrowIfDisposed();
+
+            LruCache<long, byte[]> cache = _pageCache;
+            if (cache != null && cache.TryGetValue(n, out byte[] cached))
+            {
+                Interlocked.Increment(ref _cacheHits);
+                return cached;
+            }
+
+            Interlocked.Increment(ref _cacheMisses);
+            ReadPageInto(n, scratch);
+            return scratch;
+        }
+
+        /// <summary>Allocates one page-sized scratch buffer for the duration of a scan.</summary>
+        private byte[] NewScanBuffer() => new byte[_pgSz];
 
         /// <summary>Reads a page through the cache if enabled (PageCacheSize > 0).</summary>
         private byte[] ReadPageCached(long n)
@@ -396,7 +519,31 @@ namespace JetDatabaseReader
             return result;
         }
 
+        /// <summary>
+        /// Parsed table definitions, keyed by TDEF page. Every read, every <c>GetTableStats</c>,
+        /// and every <c>GetStatistics</c> re-read and re-parsed the TDEF page chain; the result
+        /// only changes if the schema does, which needs a <see cref="Refresh"/> anyway.
+        /// </summary>
+        private readonly Dictionary<long, TableDef> _tdefCache = new Dictionary<long, TableDef>();
+        private readonly object _tdefLock = new object();
+
         private TableDef ReadTableDef(long tdefPage)
+        {
+            lock (_tdefLock)
+            {
+                if (_tdefCache.TryGetValue(tdefPage, out TableDef cached)) return cached;
+            }
+
+            TableDef parsed = ReadTableDefUncached(tdefPage);
+
+            lock (_tdefLock)
+            {
+                _tdefCache[tdefPage] = parsed;
+            }
+            return parsed;
+        }
+
+        private TableDef ReadTableDefUncached(long tdefPage)
         {
             byte[] td = ReadTDefBytes(tdefPage);
             if (td == null || td.Length < _tdBlockEnd) return null;
@@ -529,19 +676,41 @@ namespace JetDatabaseReader
                 int  catPages = 0;
                 int  allRows  = 0;
 
+                // This pass already touches every page header, so recording each data page's
+                // owning TDEF costs nothing extra and saves every later read a whole-file scan.
+                var index = new Dictionary<long, List<PageRun>>();
+
+                RowShape msysShape = BuildShape(msys, null);
+                var catScanner = new RowScanner();
+                var catRow = new string[msysShape.Width];
+
+                byte[] scan = NewScanBuffer();
                 for (long p = 3; p < totPages; p++)
                 {
-                    byte[] page = ReadPageCached(p);
+                    byte[] page = ReadPageForScan(p, scan);
                     if (page[0] != 0x01) continue;             // data pages only
-                    if (Ri32(page, _dpTDefOff) != 2) continue; // must belong to MSysObjects
+
+                    // Same expression the read loops compare against, so the index is an exact
+                    // memoization of their filter — not a heuristic that could miss pages.
+                    long owner = Ri32(page, _dpTDefOff);
+                    if (!index.TryGetValue(owner, out List<PageRun> runs))
+                    {
+                        runs = new List<PageRun>();
+                        index[owner] = runs;
+                    }
+                    AppendPage(runs, p);
+
+                    if (owner != 2) continue;                  // must belong to MSysObjects
                     catPages++;
 
-                    foreach (List<string> row in EnumerateRows(page, msys))
+                    foreach (RowSpan span in EnumerateRowSpans(page, catScanner))
                     {
+                        if (!CrackRow(page, span.Start, span.Size, msysShape, catRow, null)) continue;
+
                         allRows++;
-                        string typeStr  = SafeGet(row, idxType);
-                        string nameStr  = SafeGet(row, idxName);
-                        string flagsStr = SafeGet(row, idxFlags);
+                        string typeStr  = SafeGet(catRow, idxType);
+                        string nameStr  = SafeGet(catRow, idxName);
+                        string flagsStr = SafeGet(catRow, idxFlags);
 
                         if (!int.TryParse(typeStr, out int objType) || objType != OBJ_TABLE)
                             continue;
@@ -555,7 +724,7 @@ namespace JetDatabaseReader
                         long tdefPage = 0;
                         if (idxId >= 0)
                         {
-                            long.TryParse(SafeGet(row, idxId), out long id);
+                            long.TryParse(SafeGet(catRow, idxId), out long id);
                             tdefPage = id & 0x00FFFFFFL;
                         }
 
@@ -565,26 +734,153 @@ namespace JetDatabaseReader
                 }
 
                 diag.AppendLine($"Catalog pages: {catPages}  Total rows scanned: {allRows}  User tables: {result.Count}");
+                int totalRuns = 0;
+                foreach (var kv in index) totalRuns += kv.Value.Count;
+                diag.AppendLine($"Page index: {index.Count} distinct owners, {totalRuns} runs over {totPages} pages");
                 if (DiagnosticsEnabled)
                 {
                     foreach (var e in result)
                         diag.AppendLine($"  [{e.Name}] TDEF page {e.TDefPage}");
                 }
 
+                // Trim the growth slack off each list before publishing — List<T> over-allocates
+                // by up to 2x, and this structure outlives the scan.
+                var trimmed = new Dictionary<long, PageRun[]>(index.Count);
+                foreach (var kv in index)
+                    trimmed[kv.Key] = kv.Value.ToArray();
+
                 LastDiagnostics = diag.ToString();
+
+                // Publish the index BEFORE the catalog: _catalogCache != null is the fast-path
+                // exit for concurrent callers, and they consult the index right after.
+                Interlocked.Exchange(ref _indexedPages, totPages);
+                _pageIndex = trimmed;
                 _catalogCache = result;
                 return _catalogCache;
             }
         }
 
-        private static string SafeGet(List<string> row, int idx) =>
-            (idx >= 0 && idx < row.Count) ? row[idx] : string.Empty;
+        private static string SafeGet(string[] row, int idx) =>
+            (idx >= 0 && idx < row.Length) ? row[idx] : string.Empty;
 
         /// <summary>Finds a catalog entry by name (case-insensitive) without re-scanning the catalog.</summary>
         private CatalogEntry GetCatalogEntry(string tableName)
         {
             return GetUserTables().Find(e =>
                 string.Equals(e.Name, tableName, StringComparison.OrdinalIgnoreCase));
+        }
+
+        // ── Page index ────────────────────────────────────────────────────
+
+        /// <summary>
+        /// Yields, in ascending order, the data pages belonging to <paramref name="tdefPage"/>.
+        /// Falls back to a whole-file scan when the catalog (and therefore the index) could not
+        /// be read, so behaviour is never worse than before the index existed.
+        /// </summary>
+        private IEnumerable<long> EnumerateTablePages(long tdefPage)
+        {
+            GetUserTables();   // builds the index on first call; cached afterwards
+
+            Dictionary<long, PageRun[]> index = _pageIndex;
+            if (index == null)
+            {
+                // Unreadable catalog — the legacy behaviour is the safe fallback.
+                long total = _fs.Length / _pgSz;
+                for (long p = 3; p < total; p++)
+                    yield return p;
+                yield break;
+            }
+
+            // The file may have grown since the index was built: FileShare.ReadWrite is the
+            // default, so another process (e.g. Access) can append pages while we read.
+            index = ExtendIndexIfFileGrew(index);
+
+            if (index.TryGetValue(tdefPage, out PageRun[] runs))
+            {
+                for (int i = 0; i < runs.Length; i++)
+                {
+                    long end = runs[i].End;
+                    for (long p = runs[i].Start; p <= end; p++)
+                        yield return p;
+                }
+            }
+        }
+
+        /// <summary>
+        /// Appends <paramref name="page"/> to <paramref name="runs"/>, extending the last run when
+        /// the page continues it. Pages are always appended in ascending order.
+        /// </summary>
+        private static void AppendPage(List<PageRun> runs, long page)
+        {
+            int n = runs.Count;
+            if (n > 0)
+            {
+                PageRun last = runs[n - 1];
+                if (last.End + 1 == page)
+                {
+                    last.Count++;
+                    runs[n - 1] = last;
+                    return;
+                }
+            }
+            runs.Add(new PageRun { Start = page, Count = 1 });
+        }
+
+        /// <summary>
+        /// Indexes any pages appended since the last scan. Normally a single length comparison.
+        /// </summary>
+        private Dictionary<long, PageRun[]> ExtendIndexIfFileGrew(Dictionary<long, PageRun[]> current)
+        {
+            long total = _fs.Length / _pgSz;
+            if (total <= Interlocked.Read(ref _indexedPages)) return current;
+
+            lock (_indexLock)
+            {
+                if (_pageIndex == null) return current;
+
+                long from = Interlocked.Read(ref _indexedPages);
+                total = _fs.Length / _pgSz;
+                if (total <= from) return _pageIndex;
+
+                var added = new Dictionary<long, List<PageRun>>();
+                byte[] scan = NewScanBuffer();
+                for (long p = from; p < total; p++)
+                {
+                    byte[] page = ReadPageForScan(p, scan);
+                    if (page[0] != 0x01) continue;
+
+                    long owner = Ri32(page, _dpTDefOff);
+                    if (!added.TryGetValue(owner, out List<PageRun> list))
+                    {
+                        list = new List<PageRun>();
+                        added[owner] = list;
+                    }
+                    AppendPage(list, p);
+                }
+
+                // Appended pages have higher numbers than every indexed page, so concatenating
+                // preserves the ascending order the read loops depend on for row ordering.
+                var merged = new Dictionary<long, PageRun[]>(_pageIndex);
+                foreach (var kv in added)
+                {
+                    merged.TryGetValue(kv.Key, out PageRun[] existing);
+                    var combined = new List<PageRun>(existing ?? new PageRun[0]);
+
+                    // Re-append run by run so a new run that continues the last indexed one merges
+                    // instead of leaving an artificial split.
+                    foreach (PageRun run in kv.Value)
+                    {
+                        long end = run.End;
+                        for (long p = run.Start; p <= end; p++) AppendPage(combined, p);
+                    }
+
+                    merged[kv.Key] = combined.ToArray();
+                }
+
+                Interlocked.Exchange(ref _indexedPages, total);
+                _pageIndex = merged;
+                return merged;
+            }
         }
 
         // ── Public API ────────────────────────────────────────────────────
@@ -622,18 +918,35 @@ namespace JetDatabaseReader
                 };
 
             var headers = td.Columns.Select(c => c.Name).ToList();
-            var rows    = new List<List<string>>();
-            long total  = _fs.Length / _pgSz;
 
-            for (long p = 3; p < total && rows.Count < maxRows; p++)
+            // Populated from the TDEF like every other read path. This used to be handed back
+            // empty, so callers could see the headers but never the column types.
+            var schema = td.Columns.ConvertAll(c => new TableColumn
             {
-                byte[] page = ReadPageCached(p);
+                Name = c.Name,
+                Type = TypeCodeToClrType(c.Type),
+                Size = SizeForColumn(c)
+            });
+
+            var rows    = new List<List<string>>();
+
+            RowShape shape = BuildShape(td, null);
+            var scanner = new RowScanner();
+            var buf = new string[shape.Width];
+            byte[] scan = NewScanBuffer();
+
+            foreach (long p in EnumerateTablePages(entry.TDefPage))
+            {
+                if (rows.Count >= maxRows) break;
+
+                byte[] page = ReadPageForScan(p, scan);
                 if (page[0] != 0x01) continue;
                 if ((long)Ri32(page, _dpTDefOff) != entry.TDefPage) continue;
 
-                foreach (List<string> row in EnumerateRows(page, td))
+                foreach (RowSpan span in EnumerateRowSpans(page, scanner))
                 {
-                    rows.Add(row);
+                    if (!CrackRow(page, span.Start, span.Size, shape, buf, null)) continue;
+                    rows.Add(new List<string>(buf));
                     if (rows.Count >= maxRows) break;
                 }
             }
@@ -642,7 +955,7 @@ namespace JetDatabaseReader
             {
                 Headers    = headers,
                 Rows       = rows,
-                Schema     = new List<TableColumn>(),
+                Schema     = schema,
                 TableName  = entry.Name,
                 TableCount = tables.Count
             };
@@ -711,11 +1024,11 @@ namespace JetDatabaseReader
             if (entry == null) return 0;
 
             long count = 0;
-            long total = _fs.Length / _pgSz;
 
-            for (long p = 3; p < total; p++)
+            byte[] scan = NewScanBuffer();
+            foreach (long p in EnumerateTablePages(entry.TDefPage))
             {
-                byte[] page = ReadPageCached(p);
+                byte[] page = ReadPageForScan(p, scan);
                 if (page[0] != 0x01) continue;
                 if ((long)Ri32(page, _dpTDefOff) != entry.TDefPage) continue;
 
@@ -768,23 +1081,24 @@ namespace JetDatabaseReader
                 Size = SizeForColumn(c)
             });
             var typedRows = new List<object[]>();
-            long total    = _fs.Length / _pgSz;
 
-            for (long p = 3; p < total && typedRows.Count < maxRows; p++)
+            RowShape shape = BuildShape(td, null);
+            var scanner = new RowScanner();
+            var buf = new object[shape.Width];
+            byte[] scan = NewScanBuffer();
+
+            foreach (long p in EnumerateTablePages(entry.TDefPage))
             {
-                byte[] page = ReadPageCached(p);
+                if (typedRows.Count >= maxRows) break;
+
+                byte[] page = ReadPageForScan(p, scan);
                 if (page[0] != 0x01) continue;
                 if ((long)Ri32(page, _dpTDefOff) != entry.TDefPage) continue;
 
-                foreach (List<string> row in EnumerateRows(page, td))
+                foreach (RowSpan span in EnumerateRowSpans(page, scanner))
                 {
-                    var typedRow = new object[row.Count];
-                    for (int i = 0; i < row.Count && i < td.Columns.Count; i++)
-                    {
-                        Type colType = TypeCodeToClrType(td.Columns[i].Type);
-                        typedRow[i] = TypedValueParser.ParseValue(row[i], colType);
-                    }
-                    typedRows.Add(typedRow);
+                    if (!CrackRow(page, span.Start, span.Size, shape, null, buf)) continue;
+                    typedRows.Add((object[])buf.Clone());
                     if (typedRows.Count >= maxRows) break;
                 }
             }
@@ -829,17 +1143,24 @@ namespace JetDatabaseReader
                 Size = SizeForColumn(c)
             });
             var rows  = new List<List<string>>();
-            long total = _fs.Length / _pgSz;
 
-            for (long p = 3; p < total && rows.Count < maxRows; p++)
+            RowShape shape = BuildShape(td, null);
+            var scanner = new RowScanner();
+            var buf = new string[shape.Width];
+            byte[] scan = NewScanBuffer();
+
+            foreach (long p in EnumerateTablePages(entry.TDefPage))
             {
-                byte[] page = ReadPageCached(p);
+                if (rows.Count >= maxRows) break;
+
+                byte[] page = ReadPageForScan(p, scan);
                 if (page[0] != 0x01) continue;
                 if ((long)Ri32(page, _dpTDefOff) != entry.TDefPage) continue;
 
-                foreach (List<string> row in EnumerateRows(page, td))
+                foreach (RowSpan span in EnumerateRowSpans(page, scanner))
                 {
-                    rows.Add(row);
+                    if (!CrackRow(page, span.Start, span.Size, shape, buf, null)) continue;
+                    rows.Add(new List<string>(buf));
                     if (rows.Count >= maxRows) break;
                 }
             }
@@ -906,10 +1227,37 @@ namespace JetDatabaseReader
         {
             ThrowIfDisposed();
             Guard.NotNullOrEmpty(tableName, nameof(tableName));
-            return StreamRowsCore(tableName, progress);
+            return StreamRowsCore(tableName, null, progress);
         }
 
-        private IEnumerable<object[]> StreamRowsCore(string tableName, IProgress<int> progress)
+        /// <summary>
+        /// Yields only <paramref name="columns"/>, in the order given, as typed object arrays.
+        /// Columns that are not selected are never decoded — for a MEMO or OLE column that means
+        /// its LVAL pages are never even read, so projecting away blob columns can cut both time
+        /// and memory by an order of magnitude.
+        /// </summary>
+        /// <param name="tableName">Table name (case-insensitive).</param>
+        /// <param name="columns">Column names (case-insensitive). Null or empty selects all columns.</param>
+        /// <param name="progress">Optional progress reporter — receives row count after each page.</param>
+        /// <exception cref="ArgumentException">A requested column does not exist in the table.</exception>
+        public IEnumerable<object[]> StreamRows(string tableName, IReadOnlyList<string> columns,
+                                                IProgress<int> progress)
+        {
+            ThrowIfDisposed();
+            Guard.NotNullOrEmpty(tableName, nameof(tableName));
+            return StreamRowsCore(tableName, columns, progress);
+        }
+
+        /// <summary>
+        /// Streams rows without copying each one out. The yielded array is overwritten on the next
+        /// iteration, so this is only safe for consumers that read a row before advancing —
+        /// exactly the contract <see cref="System.Data.IDataReader"/> already imposes.
+        /// </summary>
+        internal IEnumerable<object[]> StreamRowsShared(string tableName, IReadOnlyList<string> columns)
+            => StreamRowsCore(tableName, columns, null, copyRows: false);
+
+        private IEnumerable<object[]> StreamRowsCore(string tableName, IReadOnlyList<string> columns,
+                                                     IProgress<int> progress, bool copyRows = true)
         {
             CatalogEntry entry = GetCatalogEntry(tableName);
             if (entry == null) yield break;
@@ -917,23 +1265,24 @@ namespace JetDatabaseReader
             TableDef td = ReadTableDef(entry.TDefPage);
             if (td == null || td.Columns.Count == 0) yield break;
 
-            long total = _fs.Length / _pgSz;
+            RowShape shape = BuildShape(td, columns);
+            var scanner = new RowScanner();
+            var buf = new object[shape.Width];
+            byte[] scan = NewScanBuffer();
+
             int rowCount = 0;
-            for (long p = 3; p < total; p++)
+            foreach (long p in EnumerateTablePages(entry.TDefPage))
             {
-                byte[] page = ReadPageCached(p);
+                byte[] page = ReadPageForScan(p, scan);
                 if (page[0] != 0x01) continue;
                 if ((long)Ri32(page, _dpTDefOff) != entry.TDefPage) continue;
 
-                foreach (List<string> row in EnumerateRows(page, td))
+                foreach (RowSpan span in EnumerateRowSpans(page, scanner))
                 {
-                    var typedRow = new object[row.Count];
-                    for (int i = 0; i < row.Count && i < td.Columns.Count; i++)
-                    {
-                        Type colType = TypeCodeToClrType(td.Columns[i].Type);
-                        typedRow[i] = TypedValueParser.ParseValue(row[i], colType);
-                    }
-                    yield return typedRow;
+                    if (!CrackRow(page, span.Start, span.Size, shape, null, buf)) continue;
+
+                    // Copy out: the consumer may keep the row, and buf is reused for the next one.
+                    yield return copyRows ? (object[])buf.Clone() : buf;
                     rowCount++;
                 }
                 progress?.Report(rowCount);
@@ -951,10 +1300,27 @@ namespace JetDatabaseReader
         {
             ThrowIfDisposed();
             Guard.NotNullOrEmpty(tableName, nameof(tableName));
-            return StreamRowsAsStringsCore(tableName, progress);
+            return StreamRowsAsStringsCore(tableName, null, progress);
         }
 
-        private IEnumerable<string[]> StreamRowsAsStringsCore(string tableName, IProgress<int> progress)
+        /// <summary>
+        /// Yields only <paramref name="columns"/>, in the order given, as string arrays.
+        /// Unselected columns are never decoded. See <see cref="StreamRows(string, IReadOnlyList{string}, IProgress{int})"/>.
+        /// </summary>
+        /// <param name="tableName">Table name (case-insensitive).</param>
+        /// <param name="columns">Column names (case-insensitive). Null or empty selects all columns.</param>
+        /// <param name="progress">Optional progress reporter — receives row count after each page.</param>
+        /// <exception cref="ArgumentException">A requested column does not exist in the table.</exception>
+        public IEnumerable<string[]> StreamRowsAsStrings(string tableName, IReadOnlyList<string> columns,
+                                                         IProgress<int> progress)
+        {
+            ThrowIfDisposed();
+            Guard.NotNullOrEmpty(tableName, nameof(tableName));
+            return StreamRowsAsStringsCore(tableName, columns, progress);
+        }
+
+        private IEnumerable<string[]> StreamRowsAsStringsCore(string tableName, IReadOnlyList<string> columns,
+                                                              IProgress<int> progress)
         {
             CatalogEntry entry = GetCatalogEntry(tableName);
             if (entry == null) yield break;
@@ -962,17 +1328,24 @@ namespace JetDatabaseReader
             TableDef td = ReadTableDef(entry.TDefPage);
             if (td == null || td.Columns.Count == 0) yield break;
 
-            long total = _fs.Length / _pgSz;
+            RowShape shape = BuildShape(td, columns);
+            var scanner = new RowScanner();
+            var buf = new string[shape.Width];
+            byte[] scan = NewScanBuffer();
+
             int rowCount = 0;
-            for (long p = 3; p < total; p++)
+            foreach (long p in EnumerateTablePages(entry.TDefPage))
             {
-                byte[] page = ReadPageCached(p);
+                byte[] page = ReadPageForScan(p, scan);
                 if (page[0] != 0x01) continue;
                 if ((long)Ri32(page, _dpTDefOff) != entry.TDefPage) continue;
 
-                foreach (List<string> row in EnumerateRows(page, td))
+                foreach (RowSpan span in EnumerateRowSpans(page, scanner))
                 {
-                    yield return row.ToArray();
+                    if (!CrackRow(page, span.Start, span.Size, shape, buf, null)) continue;
+
+                    // Copy out: the consumer may keep the row, and buf is reused for the next one.
+                    yield return (string[])buf.Clone();
                     rowCount++;
                 }
                 progress?.Report(rowCount);
@@ -987,6 +1360,22 @@ namespace JetDatabaseReader
         /// <param name="tableName">Table name (case-insensitive). If null or empty, reads the first table.</param>
         /// <param name="progress">Optional progress reporter — receives row count after each page.</param>
         public DataTable ReadTableAsStringDataTable(string tableName = null, IProgress<int> progress = null)
+            => ReadTableAsStringDataTableCore(tableName, null, progress);
+
+        /// <summary>
+        /// Reads only <paramref name="columns"/> into a DataTable of string columns.
+        /// Unselected columns are never decoded.
+        /// </summary>
+        /// <param name="tableName">Table name (case-insensitive). If null or empty, reads the first table.</param>
+        /// <param name="columns">Column names (case-insensitive). Null or empty selects all columns.</param>
+        /// <param name="progress">Optional progress reporter — receives row count after each page.</param>
+        /// <exception cref="ArgumentException">A requested column does not exist in the table.</exception>
+        public DataTable ReadTableAsStringDataTable(string tableName, IReadOnlyList<string> columns,
+                                                    IProgress<int> progress)
+            => ReadTableAsStringDataTableCore(tableName, columns, progress);
+
+        private DataTable ReadTableAsStringDataTableCore(string tableName, IReadOnlyList<string> columns,
+                                                         IProgress<int> progress)
         {
             ThrowIfDisposed();
             // If no table name specified, use the first table
@@ -1003,25 +1392,56 @@ namespace JetDatabaseReader
             TableDef td = ReadTableDef(entry.TDefPage);
             if (td == null || td.Columns.Count == 0) return null;
 
+            RowShape shape = BuildShape(td, columns);
+
             var dt = new DataTable(tableName);
-            foreach (var col in td.Columns)
-                dt.Columns.Add(col.Name, typeof(string));
+            for (int i = 0; i < shape.Width; i++)
+                dt.Columns.Add(shape.Names[i], typeof(string));
 
-            long total = _fs.Length / _pgSz;
-            for (long p = 3; p < total; p++)
+            var scanner = new RowScanner();
+            var buf = new string[shape.Width];
+            byte[] scan = NewScanBuffer();
+
+            // Suspends index maintenance and constraint checking for the duration of the load.
+            dt.BeginLoadData();
+            try
             {
-                byte[] page = ReadPageCached(p);
-                if (page[0] != 0x01) continue;
-                if ((long)Ri32(page, _dpTDefOff) != entry.TDefPage) continue;
-
-                foreach (List<string> row in EnumerateRows(page, td))
+                foreach (long p in EnumerateTablePages(entry.TDefPage))
                 {
-                    dt.Rows.Add(row.ToArray());
+                    byte[] page = ReadPageForScan(p, scan);
+                    if (page[0] != 0x01) continue;
+                    if ((long)Ri32(page, _dpTDefOff) != entry.TDefPage) continue;
+
+                    foreach (RowSpan span in EnumerateRowSpans(page, scanner))
+                    {
+                        // DataRowCollection.Add copies the values, so buf can be reused.
+                        if (CrackRow(page, span.Start, span.Size, shape, buf, null))
+                            dt.Rows.Add(buf);
+                    }
+                    progress?.Report(dt.Rows.Count);
                 }
-                progress?.Report(dt.Rows.Count);
+            }
+            finally
+            {
+                dt.EndLoadData();
             }
 
             return dt;
+        }
+
+        /// <summary>
+        /// Returns the column names of the specified table, in table order.
+        /// </summary>
+        public List<string> GetColumnNames(string tableName)
+        {
+            ThrowIfDisposed();
+            Guard.NotNullOrEmpty(tableName, nameof(tableName));
+
+            CatalogEntry entry = GetCatalogEntry(tableName);
+            if (entry == null) return new List<string>();
+
+            TableDef td = ReadTableDef(entry.TDefPage);
+            return td == null ? new List<string>() : td.Columns.ConvertAll(c => c.Name);
         }
 
         /// <summary>
@@ -1129,6 +1549,35 @@ namespace JetDatabaseReader
         }
 
         /// <summary>
+        /// Opens a forward-only cursor over the table. This is the constant-memory path for moving
+        /// a large table elsewhere — <c>SqlBulkCopy.WriteToServer(reader)</c> or
+        /// <c>DataTable.Load(reader)</c> stream row by row instead of materialising the table.
+        /// </summary>
+        /// <param name="tableName">Table name (case-insensitive).</param>
+        /// <param name="columns">Column names (case-insensitive). Null or empty selects all columns.</param>
+        /// <exception cref="ArgumentException">The table, or a requested column, does not exist.</exception>
+        public AccessDataReader CreateDataReader(string tableName, IReadOnlyList<string> columns = null)
+        {
+            ThrowIfDisposed();
+            Guard.NotNullOrEmpty(tableName, nameof(tableName));
+
+            CatalogEntry entry = GetCatalogEntry(tableName);
+            if (entry == null)
+                throw new ArgumentException($"Table '{tableName}' does not exist in this database.", nameof(tableName));
+
+            TableDef td = ReadTableDef(entry.TDefPage);
+            if (td == null || td.Columns.Count == 0)
+                throw new InvalidDataException($"Cannot read the table definition for '{tableName}'.");
+
+            RowShape shape = BuildShape(td, columns);
+
+            // StreamRowsShared hands back the same array each row; AccessDataReader never retains
+            // it past the next Read(), which is exactly what IDataReader promises its callers.
+            return new AccessDataReader(tableName, shape.Names, shape.ClrTypes,
+                                        StreamRowsShared(tableName, columns).GetEnumerator());
+        }
+
+        /// <summary>
         /// Creates a fluent query interface for the specified table.
         /// </summary>
         public TableQuery Query(string tableName)
@@ -1164,6 +1613,21 @@ namespace JetDatabaseReader
         /// <param name="tableName">Table name (case-insensitive). If null or empty, reads the first table.</param>
         /// <param name="progress">Optional progress reporter — receives row count after each page.</param>
         public DataTable ReadTable(string tableName = null, IProgress<int> progress = null)
+            => ReadTableCore(tableName, null, progress);
+
+        /// <summary>
+        /// Reads only <paramref name="columns"/> into a DataTable with native CLR column types.
+        /// Unselected columns are never decoded — see
+        /// <see cref="StreamRows(string, IReadOnlyList{string}, IProgress{int})"/>.
+        /// </summary>
+        /// <param name="tableName">Table name (case-insensitive). If null or empty, reads the first table.</param>
+        /// <param name="columns">Column names (case-insensitive). Null or empty selects all columns.</param>
+        /// <param name="progress">Optional progress reporter — receives row count after each page.</param>
+        /// <exception cref="ArgumentException">A requested column does not exist in the table.</exception>
+        public DataTable ReadTable(string tableName, IReadOnlyList<string> columns, IProgress<int> progress)
+            => ReadTableCore(tableName, columns, progress);
+
+        private DataTable ReadTableCore(string tableName, IReadOnlyList<string> columns, IProgress<int> progress)
         {
             ThrowIfDisposed();
 
@@ -1180,33 +1644,40 @@ namespace JetDatabaseReader
             TableDef td = ReadTableDef(entry.TDefPage);
             if (td == null || td.Columns.Count == 0) return null;
 
+            RowShape shape = BuildShape(td, columns);
+
             var dt = new DataTable(tableName);
 
             // Create columns with proper CLR types
-            foreach (var col in td.Columns)
-            {
-                Type clrType = TypeCodeToClrType(col.Type);
-                dt.Columns.Add(col.Name, clrType);
-            }
+            for (int i = 0; i < shape.Width; i++)
+                dt.Columns.Add(shape.Names[i], shape.ClrTypes[i]);
 
-            long total = _fs.Length / _pgSz;
-            for (long p = 3; p < total; p++)
-            {
-                byte[] page = ReadPageCached(p);
-                if (page[0] != 0x01) continue;
-                if ((long)Ri32(page, _dpTDefOff) != entry.TDefPage) continue;
+            var scanner = new RowScanner();
+            var buf = new object[shape.Width];
+            byte[] scan = NewScanBuffer();
 
-                foreach (List<string> row in EnumerateRows(page, td))
+            // Suspends index maintenance and constraint checking for the duration of the load.
+            dt.BeginLoadData();
+            try
+            {
+                foreach (long p in EnumerateTablePages(entry.TDefPage))
                 {
-                    var dataRow = dt.NewRow();
-                    for (int i = 0; i < row.Count && i < td.Columns.Count; i++)
+                    byte[] page = ReadPageForScan(p, scan);
+                    if (page[0] != 0x01) continue;
+                    if ((long)Ri32(page, _dpTDefOff) != entry.TDefPage) continue;
+
+                    foreach (RowSpan span in EnumerateRowSpans(page, scanner))
                     {
-                        Type colType = TypeCodeToClrType(td.Columns[i].Type);
-                        dataRow[i] = TypedValueParser.ParseValue(row[i], colType);
+                        // DataRowCollection.Add copies the values, so buf can be reused.
+                        if (CrackRow(page, span.Start, span.Size, shape, null, buf))
+                            dt.Rows.Add(buf);
                     }
-                    dt.Rows.Add(dataRow);
+                    progress?.Report(dt.Rows.Count);
                 }
-                progress?.Report(dt.Rows.Count);
+            }
+            finally
+            {
+                dt.EndLoadData();
             }
 
             return dt;
@@ -1275,82 +1746,183 @@ namespace JetDatabaseReader
 
         // ── Row enumeration ───────────────────────────────────────────────
 
-        /// <summary>Yields decoded rows from a single data page.</summary>
-        private IEnumerable<List<string>> EnumerateRows(byte[] page, TableDef td)
+        /// <summary>Bounds of one live row within a data page.</summary>
+        private struct RowSpan
+        {
+            public int Start;
+            public int Size;
+        }
+
+        /// <summary>
+        /// Resolves which columns a read decodes. <paramref name="columns"/> null or empty means
+        /// every column in table order; otherwise the named columns, in the order given.
+        /// </summary>
+        private RowShape BuildShape(TableDef td, IReadOnlyList<string> columns)
+        {
+            int[] source;
+            bool identity = columns == null || columns.Count == 0;
+
+            if (identity)
+            {
+                source = new int[td.Columns.Count];
+                for (int i = 0; i < source.Length; i++) source[i] = i;
+            }
+            else
+            {
+                source = new int[columns.Count];
+                for (int i = 0; i < columns.Count; i++)
+                {
+                    string want = columns[i];
+                    int idx = td.Columns.FindIndex(c =>
+                        string.Equals(c.Name, want, StringComparison.OrdinalIgnoreCase));
+
+                    if (idx < 0)
+                        throw new ArgumentException(
+                            $"Column '{want}' does not exist in this table. Available: " +
+                            string.Join(", ", td.Columns.ConvertAll(c => c.Name)),
+                            nameof(columns));
+
+                    source[i] = idx;
+                }
+            }
+
+            var shape = new RowShape
+            {
+                Table      = td,
+                Source     = source,
+                Columns    = new ColumnInfo[source.Length],
+                Names      = new string[source.Length],
+                ClrTypes   = new Type[source.Length],
+                IsIdentity = identity
+            };
+
+            for (int o = 0; o < source.Length; o++)
+            {
+                ColumnInfo c = td.Columns[source[o]];
+                shape.Columns[o]  = c;
+                shape.Names[o]    = c.Name;
+                shape.ClrTypes[o] = TypeCodeToClrType(c.Type);
+            }
+
+            return shape;
+        }
+
+        /// <summary>
+        /// Row-offset entries on a data page, clamped to what fits. The field is 16 bits, so a
+        /// corrupt page can claim 65535 rows and send the offset table reading past the buffer.
+        /// </summary>
+        private int PageRowCount(byte[] page)
         {
             int numRows = Ru16(page, _dpNumRows);
-            if (numRows == 0) yield break;
+            int maxRows = (_pgSz - _dpRowsStart) / 2;
+            return numRows > maxRows ? maxRows : numRows;
+        }
 
-            // Collect all raw offset entries (including deleted / overflow)
-            // so we can compute boundaries for live rows
-            var rawOffsets = new int[numRows];
+        /// <summary>
+        /// Reads every row-offset entry on the page into <paramref name="s"/> and sorts the
+        /// physical positions so each row's end can be found by binary search.
+        /// </summary>
+        private int LoadRowOffsets(byte[] page, RowScanner s)
+        {
+            int numRows = PageRowCount(page);
+            s.SortedCount = 0;
+            if (numRows == 0) return 0;
+
+            s.EnsureCapacity(numRows);
+
+            int sorted = 0;
             for (int r = 0; r < numRows; r++)
-                rawOffsets[r] = Ru16(page, _dpRowsStart + r * 2);
+            {
+                int raw = Ru16(page, _dpRowsStart + r * 2);
+                s.Raw[r] = raw;
 
-            // Sort the physical positions (lower 13 bits) for boundary computation
-            int[] positions = rawOffsets
-                .Select(o => o & 0x1FFF)
-                .Where(o => o > 0 && o < _pgSz)
-                .OrderBy(o => o)
-                .ToArray();
+                int pos = raw & 0x1FFF;
+                if (pos > 0 && pos < _pgSz) s.Sorted[sorted++] = pos;
+            }
+
+            Array.Sort(s.Sorted, 0, sorted);
+            s.SortedCount = sorted;
+            return numRows;
+        }
+
+        /// <summary>
+        /// A row ends just before the next higher row start, or at the end of the page.
+        /// Binary search over the sorted positions, replacing a linear probe per row.
+        /// </summary>
+        private int FindRowEnd(RowScanner s, int rowStart)
+        {
+            int lo = 0, hi = s.SortedCount;
+            while (lo < hi)
+            {
+                int mid = (int)(((uint)(lo + hi)) >> 1);
+                if (s.Sorted[mid] > rowStart) hi = mid; else lo = mid + 1;
+            }
+            return lo < s.SortedCount ? s.Sorted[lo] - 1 : _pgSz - 1;
+        }
+
+        /// <summary>Yields the bounds of every live (non-deleted, non-overflow) row on a page.</summary>
+        private IEnumerable<RowSpan> EnumerateRowSpans(byte[] page, RowScanner scanner)
+        {
+            int numRows = LoadRowOffsets(page, scanner);
 
             for (int r = 0; r < numRows; r++)
             {
-                int raw = rawOffsets[r];
+                int raw = scanner.Raw[r];
                 if ((raw & 0x8000) != 0) continue; // deleted
                 if ((raw & 0x4000) != 0) continue; // overflow (LVAL pointer page)
 
                 int rowStart = raw & 0x1FFF;
-
-                // Row ends just before the next higher row start, or at page end
-                int rowEnd = _pgSz - 1;
-                foreach (int pos in positions)
-                {
-                    if (pos > rowStart) { rowEnd = pos - 1; break; }
-                }
-
-                int rowSize = rowEnd - rowStart + 1;
+                int rowEnd   = FindRowEnd(scanner, rowStart);
+                int rowSize  = rowEnd - rowStart + 1;
                 if (rowSize < _numColsFldSz) continue;
 
-                // Pass the page buffer directly with absolute row bounds — no per-row copy
-                List<string> values = CrackRow(page, rowStart, rowSize, td);
-                if (values != null) yield return values;
+                yield return new RowSpan { Start = rowStart, Size = rowSize };
             }
         }
 
         // ── Row decoding ──────────────────────────────────────────────────
 
-        /// <summary>Decodes a single row's bytes (within <paramref name="page"/>) into string values per column.</summary>
-        private List<string> CrackRow(byte[] page, int rowStart, int rowSize, TableDef td)
-        {
-            if (rowSize < _numColsFldSz) return null;
+        // Boxing a bool allocates; there are only two possible values, so box them once.
+        private static readonly object BoxedTrue  = true;
+        private static readonly object BoxedFalse = false;
 
-            // Number of columns stored in THIS row (may be less than td.Columns.Count
+        /// <summary>
+        /// Decodes one row into the caller's buffer. Exactly one of <paramref name="stringOut"/>
+        /// and <paramref name="typedOut"/> must be non-null; the typed path builds CLR values
+        /// straight from the row bytes instead of formatting a string and re-parsing it.
+        /// Returns false when the row is malformed and should be skipped.
+        /// </summary>
+        private bool CrackRow(byte[] page, int rowStart, int rowSize, RowShape shape,
+                              string[] stringOut, object[] typedOut)
+        {
+            if (rowSize < _numColsFldSz) return false;
+
+            // Number of columns stored in THIS row (may be less than the table's column count
             // if columns were added after this row was written)
             int numCols = _jet4 ? Ru16(page, rowStart) : page[rowStart];
-            if (numCols == 0) return null;
+            if (numCols == 0) return false;
 
             // Check for deleted-column schema mismatch
             // If the table has deleted columns AND this row has MORE columns than current schema,
             // it was written before the deletion and data alignment is ambiguous
-            if (td.HasDeletedColumns && numCols > td.Columns.Count)
+            if (shape.Table.HasDeletedColumns && numCols > shape.Table.Columns.Count)
             {
                 throw new JetLimitationException(
-                    $"Row has {numCols} columns but current schema has {td.Columns.Count} with deleted-column gaps. " +
+                    $"Row has {numCols} columns but current schema has {shape.Table.Columns.Count} with deleted-column gaps. " +
                     $"This row predates schema changes and data may be misaligned. " +
                     $"Solution: Compact & Repair the database in Microsoft Access to rebuild all rows.");
             }
 
             int nullMaskSz  = (numCols + 7) / 8;
             int nullMaskPos = rowSize - nullMaskSz;  // relative to rowStart
-            if (nullMaskPos < _numColsFldSz) return null;
+            if (nullMaskPos < _numColsFldSz) return false;
 
             // ── Tail section layout (high→low addresses, reading from end) ──
             //  Jet4: [null_mask][var_len(2)][var_table(varLen*2)][eod(2)]
             //  Jet3: [null_mask][var_len(1)][jump_table(n*1)][var_table(varLen*1)][eod(1)]
 
             int varLenPos = nullMaskPos - _varLenFldSz;  // relative
-            if (varLenPos < _numColsFldSz) return null;
+            if (varLenPos < _numColsFldSz) return false;
 
             int varLen = _jet4 ? Ru16(page, rowStart + varLenPos) : page[rowStart + varLenPos];
 
@@ -1359,19 +1931,20 @@ namespace JetDatabaseReader
 
             int varTableStart = varLenPos - jumpSz - varLen * _varEntrySz;  // relative
             int eodPos        = varTableStart - _eodFldSz;                  // relative
-            if (eodPos < _numColsFldSz) return null;
+            if (eodPos < _numColsFldSz) return false;
 
             int eod = _jet4 ? Ru16(page, rowStart + eodPos) : page[rowStart + eodPos];
 
-            // ── Decode each column ────────────────────────────────────────
-            var result = new List<string>(td.Columns.Count);
+            // ── Decode each selected column ───────────────────────────────
+            ColumnInfo[] cols = shape.Columns;
+            bool typed = typedOut != null;
 
-            for (int i = 0; i < td.Columns.Count; i++)
+            for (int o = 0; o < cols.Length; o++)
             {
-                ColumnInfo col = td.Columns[i];
+                ColumnInfo col = cols[o];
 
                 // null_mask bit index = col.ColNum (the descriptor's col_num field),
-                // NOT the loop index i.  JET rows index the mask by col_num,
+                // NOT the output position.  JET rows index the mask by col_num,
                 // while the TDEF may store columns in a different order (e.g. alphabetically).
                 bool nullBit = false;
                 if (col.ColNum < numCols)
@@ -1386,7 +1959,8 @@ namespace JetDatabaseReader
                 // In JET: bit SET (1) = TRUE for BOOL.
                 if (col.Type == T_BOOL)
                 {
-                    result.Add(nullBit ? "True" : "False");
+                    if (typed) typedOut[o] = nullBit ? BoxedTrue : BoxedFalse;
+                    else       stringOut[o] = nullBit ? "True" : "False";
                     continue;
                 }
 
@@ -1395,7 +1969,8 @@ namespace JetDatabaseReader
                 // Column also has no value when it was added after this row was written.
                 if (col.ColNum >= numCols || !nullBit)
                 {
-                    result.Add(string.Empty);
+                    if (typed) typedOut[o] = DBNull.Value;
+                    else       stringOut[o] = string.Empty;
                     continue;
                 }
 
@@ -1404,48 +1979,170 @@ namespace JetDatabaseReader
                     int start = _numColsFldSz + col.FixedOff;  // relative
                     int sz    = FixedSize(col.Type, col.Size);
                     if (sz == 0 || start + sz > rowSize)
-                    { result.Add(string.Empty); continue; }
-                    result.Add(ReadFixed(page, rowStart + start, col, sz));
+                    {
+                        if (typed) typedOut[o] = DBNull.Value;
+                        else       stringOut[o] = string.Empty;
+                        continue;
+                    }
+
+                    if (typed) typedOut[o] = ReadFixedTyped(page, rowStart + start, col, sz);
+                    else       stringOut[o] = ReadFixed(page, rowStart + start, col, sz);
                 }
                 else
                 {
                     // Variable column — look up its offset in the reversed var_table.
                     // var_table is stored in reverse column order:
                     //   entry for VarIdx=k  →  varTableStart + (varLen-1-k)*varEntrySz
-                    if (col.VarIdx >= varLen)
-                    { result.Add(string.Empty); continue; }
+                    int dataStart = 0, dataLen = -1;
 
-                    int entryPos = varTableStart + (varLen - 1 - col.VarIdx) * _varEntrySz;  // relative
-                    if (entryPos < 0 || entryPos + _varEntrySz > rowSize)
-                    { result.Add(string.Empty); continue; }
-
-                    int varOff = _jet4 ? Ru16(page, rowStart + entryPos) : page[rowStart + entryPos];
-
-                    // End of this variable column's data
-                    int varEnd;
-                    if (col.VarIdx + 1 < varLen)
+                    if (col.VarIdx < varLen)
                     {
-                        int nextEntry = varTableStart + (varLen - 2 - col.VarIdx) * _varEntrySz;  // relative
-                        varEnd = (_jet4 ? Ru16(page, rowStart + nextEntry) : page[rowStart + nextEntry]);
+                        int entryPos = varTableStart + (varLen - 1 - col.VarIdx) * _varEntrySz;  // relative
+                        if (entryPos >= 0 && entryPos + _varEntrySz <= rowSize)
+                        {
+                            int varOff = _jet4 ? Ru16(page, rowStart + entryPos) : page[rowStart + entryPos];
+
+                            // End of this variable column's data
+                            int varEnd;
+                            if (col.VarIdx + 1 < varLen)
+                            {
+                                int nextEntry = varTableStart + (varLen - 2 - col.VarIdx) * _varEntrySz;  // relative
+                                varEnd = (_jet4 ? Ru16(page, rowStart + nextEntry) : page[rowStart + nextEntry]);
+                            }
+                            else
+                            {
+                                varEnd = eod;
+                            }
+
+                            // var_table entries are ROW offsets (from row[0]), not data-area offsets.
+                            // FixedOff is a data-area offset (requires + _numColsFldSz), but var_table
+                            // entries already include the num_cols header bytes.
+                            dataStart = varOff;
+                            dataLen   = varEnd - varOff;
+                            if (dataLen < 0 || dataStart < 0 || dataStart + dataLen > rowSize)
+                                dataLen = -1;
+                        }
                     }
-                    else
+
+                    if (dataLen < 0)
                     {
-                        varEnd = eod;
+                        if (typed) typedOut[o] = DBNull.Value;
+                        else       stringOut[o] = string.Empty;
+                        continue;
                     }
 
-                    // var_table entries are ROW offsets (from row[0]), not data-area offsets.
-                    // FixedOff is a data-area offset (requires + _numColsFldSz), but var_table
-                    // entries already include the num_cols header bytes.
-                    int dataStart = varOff;          // relative to rowStart
-                    int dataLen   = varEnd - varOff;
-                    if (dataLen < 0 || dataStart < 0 || dataStart + dataLen > rowSize)
-                    { result.Add(string.Empty); continue; }
-
-                    result.Add(ReadVar(page, rowStart + dataStart, dataLen, col));
+                    if (typed) typedOut[o] = ReadVarTyped(page, rowStart + dataStart, dataLen, col);
+                    else       stringOut[o] = ReadVar(page, rowStart + dataStart, dataLen, col);
                 }
             }
 
-            return result;
+            return true;
+        }
+
+        // ── Typed value readers ───────────────────────────────────────────
+        //
+        // These build the CLR value directly from the row bytes. The previous typed path went
+        // bytes → formatted string → Parse → box, which allocated a throwaway string per cell and
+        // lost precision on the way: DateTime was rendered as "yyyy-MM-dd HH:mm:ss" (dropping
+        // sub-second precision) and float/double used "G", which is lossy on .NET Framework.
+        //
+        // An empty string maps to DBNull.Value because that is what the old
+        // TypedValueParser.ParseValue("") produced — an empty TEXT column reads as null, not "".
+
+        private object ReadFixedTyped(byte[] row, int start, ColumnInfo col, int sz)
+        {
+            try
+            {
+                switch (col.Type)
+                {
+                    case T_BYTE:     return row[start];
+                    case T_INT:      return (short)Ru16(row, start);
+                    case T_LONG:     return Ri32(row, start);
+                    case T_FLOAT:    return BitConverter.ToSingle(row, start);
+                    case T_DOUBLE:   return BitConverter.ToDouble(row, start);
+                    case T_DATETIME: return OaDateToValue(BitConverter.ToDouble(row, start));
+                    case T_MONEY:    return MoneyToDecimal(BitConverter.ToInt64(row, start));
+                    case T_NUMERIC:  return ReadNumericValue(row, start);
+                    case T_GUID:     return ReadGuidValue(row, start);
+                    default:         return NullIfEmpty(BitConverter.ToString(row, start, Math.Min(sz, 8)));
+                }
+            }
+            catch (JetLimitationException)
+            {
+                throw;
+            }
+            catch (Exception)
+            {
+                return DBNull.Value;
+            }
+        }
+
+        private object ReadVarTyped(byte[] row, int start, int len, ColumnInfo col)
+        {
+            if (len <= 0) return DBNull.Value;
+            try
+            {
+                switch (col.Type)
+                {
+                    case T_TEXT:
+                        return NullIfEmpty(_jet4 ? DecodeJet4Text(row, start, len)
+                                                 : _ansiEncoding.GetString(row, start, len));
+
+                    case T_BINARY:
+                        return NullIfEmpty(BitConverter.ToString(row, start, len));
+
+                    case T_MEMO:
+                    case T_OLE:
+                        return NullIfEmpty(ReadLongValue(row, start, len, col.Type == T_OLE));
+
+                    default:
+                        return DBNull.Value;
+                }
+            }
+            catch (JetLimitationException)
+            {
+                throw;
+            }
+            catch (Exception)
+            {
+                return DBNull.Value;
+            }
+        }
+
+        /// <summary>
+        /// JET currency is an int64 of ten-thousandths. Building the decimal with an explicit
+        /// scale of 4 rather than dividing keeps the trailing zeros the old string round-trip
+        /// produced ("1.0000", not "1") — the numeric value is the same either way, but the scale
+        /// is visible through ToString() and in a DataGridView.
+        /// </summary>
+        private static decimal MoneyToDecimal(long raw)
+        {
+            bool negative = raw < 0;
+
+            // long.MinValue has no positive counterpart; the unchecked cast yields its magnitude.
+            ulong magnitude = negative ? unchecked((ulong)(-raw)) : (ulong)raw;
+
+            return new decimal((int)(magnitude & 0xFFFFFFFF), (int)(magnitude >> 32), 0, negative, 4);
+        }
+
+        private static object NullIfEmpty(string s) =>
+            string.IsNullOrEmpty(s) ? (object)DBNull.Value : s;
+
+        private static object OaDateToValue(double oaDate)
+        {
+            try   { return DateTime.FromOADate(oaDate); }
+            catch { return DBNull.Value; }
+        }
+
+        private static Guid ReadGuidValue(byte[] b, int start)
+        {
+            // First three groups are stored little-endian in the Jet format
+            return new Guid(
+                Ri32(b, start),
+                (short)Ru16(b, start + 4),
+                (short)Ru16(b, start + 6),
+                b[start + 8],  b[start + 9],  b[start + 10], b[start + 11],
+                b[start + 12], b[start + 13], b[start + 14], b[start + 15]);
         }
 
         // ── Column size helpers ───────────────────────────────────────────
@@ -1563,7 +2260,7 @@ namespace JetDatabaseReader
                 byte[] page = ReadPageCached(lvalPage);
                 if (page[0] != 0x01) return null;  // must be a data page
 
-                int numRows = Ru16(page, _dpNumRows);
+                int numRows = PageRowCount(page);
                 if (lvalRow >= numRows) return null;
 
                 int rawOff = Ru16(page, _dpRowsStart + lvalRow * 2);
@@ -1596,9 +2293,17 @@ namespace JetDatabaseReader
         /// </summary>
         private LvalChainResult ReadLvalChain(uint firstLvalDp, int maxLen)
         {
+            if (maxLen <= 0) return LvalChainResult.Failure("no chunks read");
+
             try
             {
-                var chunks = new List<byte[]>();
+                // Assemble the chain into one buffer instead of collecting chunks into a
+                // List<byte[]> and copying everything again, which peaked at twice the memo size.
+                //
+                // maxLen comes from a 3-byte header field, so a corrupt row can claim 16 MB while
+                // the chain holds a single page. Start small and grow towards maxLen rather than
+                // trusting the header up front — otherwise one bad row costs 16 MB.
+                var result = new byte[Math.Min(maxLen, 64 * 1024)];
                 int totalLen = 0;
                 uint currentDp = firstLvalDp;
                 var seen = new HashSet<uint>();
@@ -1614,7 +2319,7 @@ namespace JetDatabaseReader
                     byte[] page = ReadPageCached(lvalPage);
                     if (page[0] != 0x01) return LvalChainResult.Failure($"page {lvalPage} not data page");
 
-                    int numRows = Ru16(page, _dpNumRows);
+                    int numRows = PageRowCount(page);
                     if (lvalRow >= numRows) return LvalChainResult.Failure($"row {lvalRow} >= numRows {numRows}");
 
                     int rawOff = Ru16(page, _dpRowsStart + lvalRow * 2);
@@ -1637,32 +2342,26 @@ namespace JetDatabaseReader
                     currentDp = Ru32(page, rowStart);
                     int dataLen = (int)Ru32(page, rowStart + 4);
                     int dataStart = rowStart + 8;
+                    // Never write past what the header declared: a corrupt chain could otherwise
+                    // claim more data than it said it had.
                     int availableData = Math.Min(dataLen, rowSize - 8);
+                    availableData = Math.Min(availableData, maxLen - totalLen);
 
                     if (availableData > 0 && dataStart + availableData <= page.Length)
                     {
-                        var chunk = new byte[availableData];
-                        Buffer.BlockCopy(page, dataStart, chunk, 0, availableData);
-                        chunks.Add(chunk);
+                        if (totalLen + availableData > result.Length)
+                        {
+                            int grown = Math.Min(maxLen, Math.Max(result.Length * 2, totalLen + availableData));
+                            Array.Resize(ref result, grown);
+                        }
+
+                        Buffer.BlockCopy(page, dataStart, result, totalLen, availableData);
                         totalLen += availableData;
                     }
                 }
 
-                if (chunks.Count == 0) return LvalChainResult.Failure("no chunks read");
-                if (chunks.Count == 1) return LvalChainResult.Success(chunks[0]);
-
-                // Concatenate all chunks
-                int finalLen = Math.Min(totalLen, maxLen);
-                var result = new byte[finalLen];
-                int pos = 0;
-                foreach (var chunk in chunks)
-                {
-                    int copyLen = Math.Min(chunk.Length, finalLen - pos);
-                    Buffer.BlockCopy(chunk, 0, result, pos, copyLen);
-                    pos += copyLen;
-                    if (pos >= finalLen) break;
-                }
-                return LvalChainResult.Success(result);
+                if (totalLen == 0) return LvalChainResult.Failure("no chunks read");
+                return LvalChainResult.Success(result, totalLen);
             }
             catch (Exception ex) { return LvalChainResult.Failure(ex.Message); }
         }
@@ -1741,6 +2440,11 @@ namespace JetDatabaseReader
         {
             if (len < 12) return isOle ? "(OLE)" : "(memo)";
 
+            // Base64-encoding an OLE blob costs the blob itself plus a string 1.33x its size. When
+            // the caller does not want the payload, bail out before any of it happens — including
+            // the LVAL page reads, which is where the real cost of a table full of images lives.
+            if (isOle && OleObjectMode == OleObjectMode.Placeholder) return "(OLE)";
+
             byte bitmask = row[start + 3];
             int  memoLen  = row[start] | (row[start + 1] << 8) | (row[start + 2] << 16);
 
@@ -1780,10 +2484,10 @@ namespace JetDatabaseReader
 
             if (chain.Data != null)
             {
-                if (isOle) return TryDecodeOleObject(chain.Data, 0, chain.Data.Length) ?? "(OLE)";
+                if (isOle) return TryDecodeOleObject(chain.Data, 0, chain.Length) ?? "(OLE)";
 
-                return _jet4 ? DecodeJet4Text(chain.Data, 0, chain.Data.Length)
-                             : _ansiEncoding.GetString(chain.Data);
+                return _jet4 ? DecodeJet4Text(chain.Data, 0, chain.Length)
+                             : _ansiEncoding.GetString(chain.Data, 0, chain.Length);
             }
 
             return isOle ? $"(OLE chain error: {chain.Error})" : $"(memo chain error: {chain.Error})";
@@ -1813,7 +2517,11 @@ namespace JetDatabaseReader
         /// </summary>
         private static string DecompressJet4(byte[] b, int start, int len)
         {
-            var sb         = new StringBuilder(len);
+            // At most one char per input byte, so a single exactly-bounded buffer beats a
+            // StringBuilder: no chunk list, no growth, and one copy into the final string.
+            var chars = new char[len];
+            int n = 0;
+
             bool compressed = true;
             int i = start, end = start + len;
 
@@ -1822,17 +2530,18 @@ namespace JetDatabaseReader
                 if (compressed)
                 {
                     if (b[i] == 0x00) { compressed = false; i++; continue; }
-                    sb.Append((char)b[i++]);
+                    chars[n++] = (char)b[i++];
                 }
                 else
                 {
                     if (i + 1 >= end) break;
                     if (b[i] == 0x00 && b[i + 1] == 0x00) { compressed = true; i += 2; continue; }
-                    sb.Append((char)(b[i] | (b[i + 1] << 8)));
+                    chars[n++] = (char)(b[i] | (b[i + 1] << 8));
                     i += 2;
                 }
             }
-            return sb.ToString();
+
+            return n == 0 ? string.Empty : new string(chars, 0, n);
         }
 
         // ── Numeric / GUID helpers ────────────────────────────────────────
@@ -1851,7 +2560,17 @@ namespace JetDatabaseReader
         /// </summary>
         private static string ReadNumeric(byte[] b, int start)
         {
-            if (start + 16 > b.Length) return string.Empty;
+            object v = ReadNumericValue(b, start);
+            return v is decimal d ? d.ToString("G") : string.Empty;
+        }
+
+        /// <summary>
+        /// Decimal form of <see cref="ReadNumeric"/>. Returns <see cref="DBNull.Value"/> when the
+        /// field is truncated, matching the empty string the string path yields for that case.
+        /// </summary>
+        private static object ReadNumericValue(byte[] b, int start)
+        {
+            if (start + 16 > b.Length) return DBNull.Value;
 
             byte scale = b[start + 1];
             bool neg   = (b[start + 2] != 0);
