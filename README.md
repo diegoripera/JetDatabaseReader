@@ -341,8 +341,12 @@ catch (ObjectDisposedException) { /* reader already disposed */ }
 | ❌ Encrypted databases | Remove password in Access (File › Info › Encrypt with Password) |
 | ❌ Attachment fields (0x11) | Rare type added in Access 2007 |
 | ❌ Linked tables | Only local tables are listed |
-| ❌ Overflow rows | Rows spanning multiple pages are skipped |
 | ❌ Write operations | Read-only library |
+
+> **Overflow rows are now supported.** A row-offset entry with bit `0x4000` is a pointer to the
+> page and row actually holding the data; these used to be skipped. It mattered most in
+> `MSysObjects` — 40 of NorthwindTraders' catalog rows are overflow rows, so `Employees`, `Orders`,
+> `Products`, `PurchaseOrderStatus`, and `Welcome` were invisible to `ListTables()` entirely.
 
 ---
 

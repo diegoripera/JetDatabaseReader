@@ -134,6 +134,25 @@ three. Appended pages were already picked up automatically; this covers pages re
 - **Dead code removed** — `TypedValueParser` had no remaining callers after typed decoding stopped
   going through strings.
 
+### 🐛 Overflow rows were skipped — five Northwind tables were invisible
+
+A row-offset entry with bit `0x4000` set is not a row: it is a pointer to the page and row that
+actually hold the data, encoded like an LVAL pointer (`page << 8 | rowIndex`). These entries were
+skipped, so those rows were silently dropped.
+
+It mattered most in `MSysObjects`. Forty of NorthwindTraders' catalog rows are overflow rows, and
+following them takes the database from **23 to 28 user tables** — the ones that were invisible are
+`Employees`, `Orders`, `Products`, `PurchaseOrderStatus`, and `Welcome`.
+
+The pointer format was confirmed against real bytes before implementing: in all 18 overflow
+entries across the test databases, the target resolves to a page whose owning TDEF matches the
+source page's. One wrinkle the raw dump exposed — the target row's own offset entry carries the
+`0x8000` bit, which on an ordinary data page means "deleted". On an overflow target it does not;
+the row is live and only reachable through the pointer, so only the position bits are read there.
+
+`GetRealRowCount` now shares the same row enumeration as the read paths, so it can no longer
+disagree with `StreamRows` about which rows exist.
+
 ### ⚡ Performance: I/O and parse caching
 
 - **`FileStream` buffering** — reads are one page at a seeked offset, and with the default 4 KB

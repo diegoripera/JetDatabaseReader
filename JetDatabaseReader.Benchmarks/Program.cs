@@ -134,6 +134,24 @@ namespace JetDatabaseReader.Benchmarks
 
                 Console.WriteLine($"   Tables: {tables.Count}");
                 Console.WriteLine($"   Reader resident: {Bytes(after - before)}");
+
+                // Read every table so a table that only appears via an overflow catalog row is
+                // proven readable, not just listed.
+                foreach (TableStat s in reader.GetTableStats())
+                {
+                    string status;
+                    try
+                    {
+                        int read = reader.StreamRows(s.Name).Take(5).Count();
+                        int cols = reader.GetColumnNames(s.Name).Count;
+                        status = $"{cols} cols, tdef rowcount {s.RowCount}, read {read} row(s) OK";
+                    }
+                    catch (Exception ex)
+                    {
+                        status = $"FAILED: {ex.GetType().Name}: {ex.Message}";
+                    }
+                    Console.WriteLine($"      {s.Name,-40} {status}");
+                }
             }
             catch (Exception ex)
             {

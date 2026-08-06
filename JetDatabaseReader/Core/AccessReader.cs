@@ -705,7 +705,7 @@ namespace JetDatabaseReader
 
                     foreach (RowSpan span in EnumerateRowSpans(page, catScanner))
                     {
-                        if (!CrackRow(page, span.Start, span.Size, msysShape, catRow, null)) continue;
+                        if (!CrackRow(span.Page, span.Start, span.Size, msysShape, catRow, null)) continue;
 
                         allRows++;
                         string typeStr  = SafeGet(catRow, idxType);
@@ -945,7 +945,7 @@ namespace JetDatabaseReader
 
                 foreach (RowSpan span in EnumerateRowSpans(page, scanner))
                 {
-                    if (!CrackRow(page, span.Start, span.Size, shape, buf, null)) continue;
+                    if (!CrackRow(span.Page, span.Start, span.Size, shape, buf, null)) continue;
                     rows.Add(new List<string>(buf));
                     if (rows.Count >= maxRows) break;
                 }
@@ -1012,9 +1012,10 @@ namespace JetDatabaseReader
         }
 
         /// <summary>
-        /// Scans all data pages to count live (non-deleted, non-overflow) rows for the specified table.
+        /// Scans all data pages to count live (non-deleted) rows for the specified table,
+        /// including rows reached through an overflow pointer.
         /// This is slower than reading the TDEF RowCount (which may be stale), but always accurate.
-        /// Use this after many deletes/imports when Compact & Repair hasn't been run.
+        /// Use this after many deletes/imports when Compact &amp; Repair hasn't been run.
         /// </summary>
         public long GetRealRowCount(string tableName)
         {
@@ -1025,21 +1026,18 @@ namespace JetDatabaseReader
 
             long count = 0;
 
+            // Shares EnumerateRowSpans with the read paths so the count cannot drift from what
+            // StreamRows actually yields — the two used to disagree about overflow rows.
+            var scanner = new RowScanner();
             byte[] scan = NewScanBuffer();
+
             foreach (long p in EnumerateTablePages(entry.TDefPage))
             {
                 byte[] page = ReadPageForScan(p, scan);
                 if (page[0] != 0x01) continue;
                 if ((long)Ri32(page, _dpTDefOff) != entry.TDefPage) continue;
 
-                int numRows = Ru16(page, _dpNumRows);
-                for (int r = 0; r < numRows; r++)
-                {
-                    int raw = Ru16(page, _dpRowsStart + r * 2);
-                    if ((raw & 0x8000) != 0) continue; // deleted
-                    if ((raw & 0x4000) != 0) continue; // overflow
-                    count++;
-                }
+                foreach (RowSpan _ in EnumerateRowSpans(page, scanner)) count++;
             }
             return count;
         }
@@ -1097,7 +1095,7 @@ namespace JetDatabaseReader
 
                 foreach (RowSpan span in EnumerateRowSpans(page, scanner))
                 {
-                    if (!CrackRow(page, span.Start, span.Size, shape, null, buf)) continue;
+                    if (!CrackRow(span.Page, span.Start, span.Size, shape, null, buf)) continue;
                     typedRows.Add((object[])buf.Clone());
                     if (typedRows.Count >= maxRows) break;
                 }
@@ -1159,7 +1157,7 @@ namespace JetDatabaseReader
 
                 foreach (RowSpan span in EnumerateRowSpans(page, scanner))
                 {
-                    if (!CrackRow(page, span.Start, span.Size, shape, buf, null)) continue;
+                    if (!CrackRow(span.Page, span.Start, span.Size, shape, buf, null)) continue;
                     rows.Add(new List<string>(buf));
                     if (rows.Count >= maxRows) break;
                 }
@@ -1279,7 +1277,7 @@ namespace JetDatabaseReader
 
                 foreach (RowSpan span in EnumerateRowSpans(page, scanner))
                 {
-                    if (!CrackRow(page, span.Start, span.Size, shape, null, buf)) continue;
+                    if (!CrackRow(span.Page, span.Start, span.Size, shape, null, buf)) continue;
 
                     // Copy out: the consumer may keep the row, and buf is reused for the next one.
                     yield return copyRows ? (object[])buf.Clone() : buf;
@@ -1342,7 +1340,7 @@ namespace JetDatabaseReader
 
                 foreach (RowSpan span in EnumerateRowSpans(page, scanner))
                 {
-                    if (!CrackRow(page, span.Start, span.Size, shape, buf, null)) continue;
+                    if (!CrackRow(span.Page, span.Start, span.Size, shape, buf, null)) continue;
 
                     // Copy out: the consumer may keep the row, and buf is reused for the next one.
                     yield return (string[])buf.Clone();
@@ -1415,7 +1413,7 @@ namespace JetDatabaseReader
                     foreach (RowSpan span in EnumerateRowSpans(page, scanner))
                     {
                         // DataRowCollection.Add copies the values, so buf can be reused.
-                        if (CrackRow(page, span.Start, span.Size, shape, buf, null))
+                        if (CrackRow(span.Page, span.Start, span.Size, shape, buf, null))
                             dt.Rows.Add(buf);
                     }
                     progress?.Report(dt.Rows.Count);
@@ -1669,7 +1667,7 @@ namespace JetDatabaseReader
                     foreach (RowSpan span in EnumerateRowSpans(page, scanner))
                     {
                         // DataRowCollection.Add copies the values, so buf can be reused.
-                        if (CrackRow(page, span.Start, span.Size, shape, null, buf))
+                        if (CrackRow(span.Page, span.Start, span.Size, shape, null, buf))
                             dt.Rows.Add(buf);
                     }
                     progress?.Report(dt.Rows.Count);
@@ -1746,9 +1744,13 @@ namespace JetDatabaseReader
 
         // ── Row enumeration ───────────────────────────────────────────────
 
-        /// <summary>Bounds of one live row within a data page.</summary>
+        /// <summary>
+        /// Bounds of one live row, plus the page holding it. An overflow row's bytes live on a
+        /// different page than the one being scanned, so the page travels with the bounds.
+        /// </summary>
         private struct RowSpan
         {
+            public byte[] Page;
             public int Start;
             public int Size;
         }
@@ -1860,24 +1862,70 @@ namespace JetDatabaseReader
             return lo < s.SortedCount ? s.Sorted[lo] - 1 : _pgSz - 1;
         }
 
-        /// <summary>Yields the bounds of every live (non-deleted, non-overflow) row on a page.</summary>
+        /// <summary>Yields the bounds of every live row on a page, following overflow pointers.</summary>
         private IEnumerable<RowSpan> EnumerateRowSpans(byte[] page, RowScanner scanner)
         {
             int numRows = LoadRowOffsets(page, scanner);
+            RowScanner overflowScanner = null;
 
             for (int r = 0; r < numRows; r++)
             {
                 int raw = scanner.Raw[r];
                 if ((raw & 0x8000) != 0) continue; // deleted
-                if ((raw & 0x4000) != 0) continue; // overflow (LVAL pointer page)
+
+                if ((raw & 0x4000) != 0)
+                {
+                    // Overflow: the entry is a pointer, not a row. Same encoding as an LVAL
+                    // pointer — upper 24 bits the page, low byte the row index on it.
+                    if (overflowScanner == null) overflowScanner = new RowScanner();
+
+                    RowSpan? resolved = ResolveOverflowRow(page, raw & 0x1FFF, overflowScanner);
+                    if (resolved.HasValue) yield return resolved.Value;
+                    continue;
+                }
 
                 int rowStart = raw & 0x1FFF;
                 int rowEnd   = FindRowEnd(scanner, rowStart);
                 int rowSize  = rowEnd - rowStart + 1;
                 if (rowSize < _numColsFldSz) continue;
 
-                yield return new RowSpan { Start = rowStart, Size = rowSize };
+                yield return new RowSpan { Page = page, Start = rowStart, Size = rowSize };
             }
+        }
+
+        /// <summary>
+        /// Follows an overflow pointer to the page and row actually holding the data.
+        /// Returns null when the pointer does not resolve to a usable row.
+        /// </summary>
+        private RowSpan? ResolveOverflowRow(byte[] page, int pointerAt, RowScanner scanner)
+        {
+            if (pointerAt < 0 || pointerAt + 4 > _pgSz) return null;
+
+            uint pointer = Ru32(page, pointerAt);
+            long targetPage = pointer >> 8;
+            int  targetRow  = (int)(pointer & 0xFF);
+            if (targetPage <= 0) return null;
+
+            byte[] target;
+            try { target = ReadPageCached(targetPage); }
+            catch { return null; }
+
+            if (target[0] != 0x01) return null;
+
+            int targetRows = LoadRowOffsets(target, scanner);
+            if (targetRow >= targetRows) return null;
+
+            // The target's own offset entry carries the 0x8000 bit, which on an ordinary data page
+            // would mean "deleted". On an overflow target it does not: the row is live and only
+            // reachable through the pointer. Only the position bits are meaningful here.
+            int rowStart = scanner.Raw[targetRow] & 0x1FFF;
+            if (rowStart <= 0 || rowStart >= _pgSz) return null;
+
+            int rowEnd  = FindRowEnd(scanner, rowStart);
+            int rowSize = rowEnd - rowStart + 1;
+            if (rowSize < _numColsFldSz) return null;
+
+            return new RowSpan { Page = target, Start = rowStart, Size = rowSize };
         }
 
         // ── Row decoding ──────────────────────────────────────────────────
