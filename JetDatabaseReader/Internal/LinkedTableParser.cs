@@ -15,7 +15,14 @@ namespace JetDatabaseReader
     /// </summary>
     internal static class LinkedTableParser
     {
-        public static LinkedTable Parse(string name, string foreignName, string connect, bool odbcType)
+        /// <param name="database">
+        /// The catalog's <c>Database</c> column. An Access-to-Access link puts the file path here
+        /// and leaves <c>Connect</c> empty — only external providers use the
+        /// <c>Provider;...;DATABASE=path</c> form. Assuming otherwise makes an Access link parse
+        /// as having no source at all.
+        /// </param>
+        public static LinkedTable Parse(string name, string foreignName, string connect,
+                                        string database, bool odbcType)
         {
             var table = new LinkedTable
             {
@@ -29,17 +36,25 @@ namespace JetDatabaseReader
 
             if (odbcType || provider.StartsWith("ODBC", StringComparison.OrdinalIgnoreCase))
                 table.Kind = LinkedTableKind.Odbc;
-            else if (provider.Length == 0)
-                table.Kind = LinkedTableKind.Access;
             else if (provider.StartsWith("Excel", StringComparison.OrdinalIgnoreCase))
                 table.Kind = LinkedTableKind.Excel;
             else if (provider.StartsWith("Text", StringComparison.OrdinalIgnoreCase))
                 table.Kind = LinkedTableKind.Text;
+            else if (provider.Length == 0)
+                table.Kind = LinkedTableKind.Access;
 
-            // For ODBC, DATABASE= names a database on the server rather than a file, so exposing it
-            // as a path would invite callers to try opening something that is not there.
-            if (table.Kind != LinkedTableKind.Odbc)
-                table.SourcePath = Clause(table.ConnectionString, "DATABASE=");
+            if (table.Kind == LinkedTableKind.Odbc)
+            {
+                // DATABASE= names a database on the server rather than a file, so exposing it as a
+                // path would invite callers to open something that is not there.
+                return table;
+            }
+
+            // The dedicated column wins; the connection-string clause is the fallback external
+            // providers use.
+            table.SourcePath = string.IsNullOrEmpty(database)
+                ? Clause(table.ConnectionString, "DATABASE=")
+                : database.Trim();
 
             return table;
         }

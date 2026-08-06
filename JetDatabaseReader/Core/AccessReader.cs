@@ -697,6 +697,7 @@ namespace JetDatabaseReader
                 int idxFlags   = msys.Columns.FindIndex(c => string.Equals(c.Name, "Flags",       StringComparison.OrdinalIgnoreCase));
                 int idxConnect = msys.Columns.FindIndex(c => string.Equals(c.Name, "Connect",     StringComparison.OrdinalIgnoreCase));
                 int idxForeign = msys.Columns.FindIndex(c => string.Equals(c.Name, "ForeignName", StringComparison.OrdinalIgnoreCase));
+                int idxDatabase = msys.Columns.FindIndex(c => string.Equals(c.Name, "Database",   StringComparison.OrdinalIgnoreCase));
 
                 if (idxName < 0 || idxType < 0)
                 {
@@ -771,6 +772,7 @@ namespace JetDatabaseReader
                                 nameStr,
                                 SafeGet(catRow, idxForeign),
                                 SafeGet(catRow, idxConnect),
+                                SafeGet(catRow, idxDatabase),
                                 objType == OBJ_LINKED_ODBC));
                             continue;
                         }

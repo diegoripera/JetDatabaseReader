@@ -28,6 +28,15 @@ namespace JetDatabaseReader.Tests
         public static readonly string AutonumberDb =
             Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Test_Autonumber.accdb");
 
+        /// <summary>
+        /// Holds one local table plus a linked table (MSysObjects type 6) pointing at
+        /// AdventureLT2008.mdb. The link stores the absolute path it had when it was created, so
+        /// the source resolves only on the machine that made it — tests assert on the link's
+        /// metadata always, and follow it only when the target happens to exist.
+        /// </summary>
+        public static readonly string LinkedDb =
+            Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Test_Autonumber_linked.accdb");
+
         // Local-only large file — not added to the project or repository.
         public const string LargeFile = @"D:\Diego\Downloads\DB Matrix.accdb";
 

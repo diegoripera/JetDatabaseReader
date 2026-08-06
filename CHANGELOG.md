@@ -146,10 +146,14 @@ local table would quietly return nothing. `OpenLinkedTableSource(link)` opens th
 another Access database. ODBC links cannot be followed — that needs a driver, which is the
 dependency this library exists to avoid.
 
-> **Verification gap.** None of the available test databases contains a linked table, so the
-> connection-string parsing and the open path are covered by unit tests against the formats Access
-> writes, but the catalog-level detection of object types 4 and 6 has not been exercised against a
-> real linked database. Treat that part as unproven until a fixture exists.
+Verified against a real linked database (`Test_Autonumber_linked.accdb`), which promptly exposed a
+wrong assumption: an Access-to-Access link stores its path in the catalog's **`Database`** column
+and leaves `Connect` empty. Only external providers use the `Provider;...;DATABASE=path` form the
+first implementation assumed, so the link parsed as having no source at all. The dedicated column
+now takes precedence and the connection-string clause is the fallback.
+
+ODBC links remain covered by unit tests only — there is no ODBC fixture — but that path is a
+refusal, not a read.
 
 ### ✨ Jet4 database passwords (`.mdb`)
 

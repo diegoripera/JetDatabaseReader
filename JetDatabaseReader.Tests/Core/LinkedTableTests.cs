@@ -75,9 +75,30 @@ namespace JetDatabaseReader.Tests
         [Fact]
         public void OdbcTypedRow_IsOdbcEvenWithoutThePrefix()
         {
-            LinkedTable link = LinkedTableParser.Parse("T", "T", "DSN=Sales", odbcType: true);
+            LinkedTable link = LinkedTableParser.Parse("T", "T", "DSN=Sales", "", odbcType: true);
 
             link.Kind.Should().Be(LinkedTableKind.Odbc);
+        }
+
+        [Fact]
+        public void AccessLink_TakesThePathFromTheDatabaseColumn()
+        {
+            // This is how Access actually stores a link to another Access file: the path goes in
+            // the catalog's Database column and Connect is left empty. Reading the path out of a
+            // ";DATABASE=" clause only works for external providers.
+            LinkedTable link = Parse("Product", "Product", "", @"C:\data\Test_Autonumber.accdb");
+
+            link.Kind.Should().Be(LinkedTableKind.Access);
+            link.SourcePath.Should().Be(@"C:\data\Test_Autonumber.accdb");
+            link.IsAccessDatabase.Should().BeTrue();
+        }
+
+        [Fact]
+        public void DatabaseColumn_WinsOverTheConnectionStringClause()
+        {
+            LinkedTable link = Parse("T", "T", @"Excel 12.0;DATABASE=C:\old.xlsx", @"C:\actual.xlsx");
+
+            link.SourcePath.Should().Be(@"C:\actual.xlsx");
         }
 
         [Fact]
@@ -113,6 +134,59 @@ namespace JetDatabaseReader.Tests
 
             link.SourcePath.Should().BeNull();
             link.IsAccessDatabase.Should().BeFalse();
+        }
+
+        // ── Catalog integration, against a real linked database ───────────
+
+        [Fact]
+        public void RealLinkedDatabase_ExposesTheLink()
+        {
+            if (!TestDatabases.IsReadable(TestDatabases.LinkedDb)) return;
+
+            using var reader = TestDatabases.Open(TestDatabases.LinkedDb);
+            List<LinkedTable> links = reader.GetLinkedTables();
+
+            links.Should().ContainSingle(because: "the fixture has exactly one linked table");
+
+            LinkedTable link = links[0];
+            link.Name.Should().Be("Product");
+            link.ForeignName.Should().Be("Product");
+            link.Kind.Should().Be(LinkedTableKind.Access);
+
+            // The path lives in the catalog's Database column, not in a ";DATABASE=" clause of
+            // Connect — which is empty for an Access-to-Access link.
+            link.ConnectionString.Should().BeEmpty();
+            link.SourcePath.Should().NotBeNullOrEmpty();
+            link.SourcePath.Should().EndWith("AdventureLT2008.mdb");
+            link.IsAccessDatabase.Should().BeTrue();
+        }
+
+        [Fact]
+        public void RealLinkedDatabase_KeepsTheLinkOutOfListTables()
+        {
+            if (!TestDatabases.IsReadable(TestDatabases.LinkedDb)) return;
+
+            using var reader = TestDatabases.Open(TestDatabases.LinkedDb);
+
+            reader.ListTables().Should().NotContain("Product");
+            reader.ListTables().Should().Contain("TableTest", because: "the local table is still listed");
+        }
+
+        [Fact]
+        public void RealLinkedDatabase_CanBeFollowedToItsSource()
+        {
+            if (!TestDatabases.IsReadable(TestDatabases.LinkedDb)) return;
+
+            using var reader = TestDatabases.Open(TestDatabases.LinkedDb);
+            LinkedTable link = reader.GetLinkedTables().Single();
+
+            // Stored as an absolute path, so it only resolves on the machine that made the link.
+            if (!File.Exists(link.SourcePath)) return;
+
+            using AccessReader source = reader.OpenLinkedTableSource(link);
+
+            source.ListTables().Should().Contain(link.ForeignName);
+            source.StreamRows(link.ForeignName).Should().NotBeEmpty();
         }
 
         // ── Catalog integration ───────────────────────────────────────────
@@ -181,7 +255,8 @@ namespace JetDatabaseReader.Tests
             source.StreamRows(link.ForeignName).Should().NotBeEmpty();
         }
 
-        private static LinkedTable Parse(string name, string foreignName, string connect) =>
-            LinkedTableParser.Parse(name, foreignName, connect, odbcType: false);
+        private static LinkedTable Parse(string name, string foreignName, string connect,
+                                         string database = "") =>
+            LinkedTableParser.Parse(name, foreignName, connect, database, odbcType: false);
     }
 }

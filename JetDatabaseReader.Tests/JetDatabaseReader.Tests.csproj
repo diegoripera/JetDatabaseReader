@@ -31,5 +31,10 @@
     <None Include="Test_Autonumber.accdb">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </None>
+    <!-- Contains a type-6 linked table pointing at AdventureLT2008.mdb. The link stores an
+         absolute path from the machine that created it, so following it only works there. -->
+    <None Include="Test_Autonumber_linked.accdb">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
   </ItemGroup>
 </Project>

@@ -135,6 +135,25 @@ namespace JetDatabaseReader.Benchmarks
                 Console.WriteLine($"   Tables: {tables.Count}");
                 Console.WriteLine($"   Reader resident: {Bytes(after - before)}");
 
+                foreach (LinkedTable link in reader.GetLinkedTables())
+                {
+                    Console.WriteLine($"      LINK {link.Name,-30} kind={link.Kind} " +
+                                      $"foreign='{link.ForeignName}' path='{link.SourcePath}'");
+                    Console.WriteLine($"           connect='{link.ConnectionString}'");
+
+                    if (!link.IsAccessDatabase) continue;
+                    try
+                    {
+                        using AccessReader src = reader.OpenLinkedTableSource(link);
+                        int n = src.StreamRows(link.ForeignName).Take(5).Count();
+                        Console.WriteLine($"           followed OK, read {n} row(s) from the source");
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"           follow FAILED: {ex.GetType().Name}: {ex.Message}");
+                    }
+                }
+
                 // Read every table so a table that only appears via an overflow catalog row is
                 // proven readable, not just listed.
                 foreach (TableStat s in reader.GetTableStats())
