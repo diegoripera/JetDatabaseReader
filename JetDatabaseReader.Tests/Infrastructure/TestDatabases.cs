@@ -19,6 +19,15 @@ namespace JetDatabaseReader.Tests
         public static readonly string AdventureWorks =
             Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "AdventureLT2008.mdb");
 
+        /// <summary>
+        /// Single-table database with an autonumber Id column and two Short Text columns
+        /// (Number1, Number2) whose values look like integers but must stay as strings.
+        /// Row 8 of Number1 contains "78/465", which is an intentional non-numeric value
+        /// that proves the columns are Text, not Numeric.
+        /// </summary>
+        public static readonly string AutonumberDb =
+            Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Test_Autonumber.accdb");
+
         // Local-only large file — not added to the project or repository.
         public const string LargeFile = @"D:\Diego\Downloads\DB Matrix.accdb";
 
