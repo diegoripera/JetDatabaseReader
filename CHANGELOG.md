@@ -134,6 +134,35 @@ three. Appended pages were already picked up automatically; this covers pages re
 - **Dead code removed** — `TypedValueParser` had no remaining callers after typed decoding stopped
   going through strings.
 
+### ✨ Jet4 database passwords (`.mdb`)
+
+`AccessReaderOptions.Password` opens an `.mdb` that has a database password set, and
+`AccessReader.IsPasswordProtected` reports whether one is present.
+
+Worth being precise about what this is: a Jet4 database password is **access control, not
+encryption**. The page bodies are plain text on disk — this library could always have read them,
+and so can any hex editor. The password is verified so callers are not silently handed access they
+did not ask for, but such a file should be treated as unprotected at rest. Access truncates these
+passwords to 20 characters when setting them, so a longer supplied password is compared on the
+same terms.
+
+The layout was recovered from the bytes rather than assumed: XOR-ing the password field of a
+database against the same database without a password yields the password in clear UTF-16LE, which
+gives both the encoding and the fixed 40-byte mask.
+
+That also exposed a bug. The previous check read one byte at `0x62` and tested two bits, calling it
+an encryption flag. `0x62` is **inside** the 40-byte password field at `0x42` — it is the low half
+of the seventeenth character. It behaved like a flag only because an unset password leaves the
+mask's own value there, and would have misreported for passwords whose seventeenth character
+cleared those bits.
+
+### 🐛 Encrypted `.accdb` reported an empty database instead of an error
+
+ACE "Encrypt with Password" encrypts the page bodies. The old flag check was skipped for ACE files,
+so an encrypted `.accdb` opened cleanly and then reported zero tables — indistinguishable from an
+empty database. Page 2 always holds the `MSysObjects` definition, so a page 2 that is not a TDEF
+now raises a `NotSupportedException` naming the cause. ACE decryption itself remains unsupported.
+
 ### 🐛 Overflow rows were skipped — five Northwind tables were invisible
 
 A row-offset entry with bit `0x4000` set is not a row: it is a pointer to the page and row that

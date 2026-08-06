@@ -16,6 +16,18 @@ namespace JetDatabaseReader
         /// <summary>When true, uses parallel processing for reading multiple pages. Can improve performance for large tables. Default: false.</summary>
         public bool ParallelPageReadsEnabled { get; set; }
 
+        /// <summary>
+        /// Database password, for a Jet4 (.mdb) database that has one set. Default: null.
+        ///
+        /// Note that a Jet4 database password is access control, not encryption: the page data is
+        /// stored in plain text and this library could read it either way. The password is
+        /// verified so that callers are not silently granted access they did not ask for.
+        ///
+        /// This does not open an ACE (.accdb) database encrypted with "Encrypt with Password" —
+        /// those have genuinely encrypted pages and are still unsupported.
+        /// </summary>
+        public string Password { get; set; }
+
         /// <summary>When true, validates the database format on open. Default: true.</summary>
         public bool ValidateOnOpen { get; set; } = true;
 

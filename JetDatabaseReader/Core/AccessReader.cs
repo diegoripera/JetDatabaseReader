@@ -120,6 +120,7 @@ namespace JetDatabaseReader
         private bool _disposed;
         private long _cacheHits;
         private long _cacheMisses;
+        private readonly bool _isPasswordProtected;
 
         /// <summary>When true, GetUserTables logs verbose hex dumps for debugging. Default: false.</summary>
         public bool DiagnosticsEnabled { get; set; }
@@ -187,18 +188,24 @@ namespace JetDatabaseReader
             try { _ansiEncoding = Encoding.GetEncoding(_codePage); }
             catch { _ansiEncoding = Encoding.UTF8; _codePage = 65001; }
 
-            // Offset 0x62: encryption flag — only valid for Jet4 (ver == 1, Access 2000-2003).
-            // ACCDB format (ver >= 2, Access 2007+) has completely different header semantics
-            // at this offset; applying the Jet4 check to ACCDB files produces false positives.
-            // Truly encrypted ACCDB files are detected later when the catalog page is unreadable.
-            if (_jet4 && ver == 1 && hdr.Length > 0x62)
+            // A Jet4 database password does not encrypt anything — the pages stay in plain text
+            // and only the Jet engine refuses to open the file. So the password is verified when
+            // one is stored, and reading then proceeds normally.
+            //
+            // The old check read one byte at 0x62 and tested two bits. That byte sits inside the
+            // 40-byte password field at 0x42, so it was never a flag: it is the low half of the
+            // seventeenth character, and only behaved like one because an unset password leaves
+            // the mask's own value there.
+            // Jet4 only (ver == 1, Access 2000-2003). Jet3 uses a different field, and ACE always
+            // encrypts when a password is set, so its 0x42 bytes are not a Jet4 password field at
+            // all — decoding them with the Jet4 mask yields noise that reads as "wrong password".
+            _isPasswordProtected = ver == 1 && JetPassword.IsProtected(hdr);
+
+            if (_isPasswordProtected && !JetPassword.Matches(hdr, options.Password))
             {
-                byte encFlag = hdr[0x62];
-                // bit 0x01 = Office97 password, bit 0x02 = RC4 password
-                if ((encFlag & 0x03) != 0)
-                    throw new NotSupportedException(
-                        "This database is encrypted or password-protected. " +
-                        "Remove the password in Microsoft Access (File > Info > Encrypt with Password) and try again.");
+                throw new InvalidOperationException(options.Password == null
+                    ? "This database has a database password. Supply it via AccessReaderOptions.Password."
+                    : "The supplied password does not match this database's password.");
             }
 
             if (_jet4)
@@ -262,11 +269,31 @@ namespace JetDatabaseReader
                 _varLenFldSz    =  1;
             }
 
+            // Page 2 always holds the MSysObjects table definition. If it is not a TDEF page the
+            // page bodies are unreadable, which in practice means ACE "Encrypt with Password".
+            // Without this, an encrypted database opened cleanly and then reported zero tables.
+            var catalogHeader = new byte[1];
+            _fs.Seek(2L * _pgSz, SeekOrigin.Begin);
+            if (_fs.Read(catalogHeader, 0, 1) == 1 && catalogHeader[0] != 0x02)
+            {
+                throw new NotSupportedException(
+                    "This database's pages are encrypted (Access 'Encrypt with Password'), which " +
+                    "this library cannot read. AccessReaderOptions.Password only covers the older " +
+                    "Jet4 (.mdb) database password, which does not encrypt page data. " +
+                    "Remove the encryption in Microsoft Access (File > Info > Decrypt Database) and try again.");
+            }
+
             if (options.ValidateOnOpen)
             {
                 ValidateDatabaseFormat();
             }
         }
+
+        /// <summary>
+        /// True when the database carries a Jet4 database password. That password is access
+        /// control rather than encryption — the page data is stored in plain text either way.
+        /// </summary>
+        public bool IsPasswordProtected => _isPasswordProtected;
 
         /// <summary>
         /// Opens a JET database file and returns a new AccessReader instance.
