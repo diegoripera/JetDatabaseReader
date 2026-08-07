@@ -371,10 +371,30 @@ catch (ObjectDisposedException) { /* reader already disposed */ }
 |---|---|
 | ✅ Jet4 database password (`.mdb`) | Supply it via `AccessReaderOptions.Password` |
 | ✅ ACE encryption (`.accdb`) | Agile encryption (AES) — supply the password the same way |
-| ❌ Attachment fields (0x11) | Rare type added in Access 2007 |
+| ❌ Complex columns (0x12) | Attachment, Multi-Value and append-only Memo history — see below |
 | ⚠️ Linked tables | Listed with their source; readable only when the source is another Access file |
 | ⚠️ Jet3 (Access 97) | Implemented, but untested against a real file — see below |
 | ❌ Write operations | Read-only library |
+
+### Complex columns
+
+Access 2007 added three column kinds that do not store their values in the row: **Attachment**,
+**Multi-Value**, and append-only **Memo** history. All three share type code `0x12`, and the row
+holds only a 4-byte id pointing into hidden system tables.
+
+Those tables are not followed. The column reports `TypeName == "Complex"` and its value is that id
+rendered as bytes — `"01-00-00-00"` — which is **not** the attachment. Check `TypeName` before
+treating such a column as data:
+
+```csharp
+foreach (ColumnMetadata col in reader.GetColumnMetadata("Employees"))
+    if (col.TypeName == "Complex")
+        { /* the values live elsewhere — skip, or read them with the ACE provider */ }
+```
+
+Northwind's `Employees.Attachments` and `ProductCategories.ProductCategoryImage` are examples.
+Ordinary **OLE Object** columns are unaffected — those are stored in the row's LVAL chain and are
+read normally, including image and document detection.
 
 ### Jet3
 

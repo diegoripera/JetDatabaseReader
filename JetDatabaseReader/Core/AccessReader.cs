@@ -15,25 +15,30 @@ namespace JetDatabaseReader
     /// No OleDB, ODBC, or ACE/Jet driver installation required.
     ///
     /// Supports:
-    ///   Jet3  – Access 97 (.mdb)
     ///   Jet4+ – Access 2000-2019 (.mdb / .accdb)
+    ///   Jet3  – Access 97 (.mdb): the page layout is implemented, but no Jet3 file has been
+    ///           available to test it against, and the ACE engine can no longer create one.
     ///
     /// Features:
     ///   ✓ All standard data types (Text, Integer, Date, GUID, Currency, etc.)
     ///   ✓ MEMO fields (inline + single-page + multi-page LVAL chains)
     ///   ✓ OLE Object fields — auto-detects images (JPEG/PNG/GIF/BMP), documents (PDF/DOC/RTF), archives (ZIP)
+    ///   ✓ Overflow rows — rows whose payload lives on another page are followed, not skipped
+    ///   ✓ Password-protected and encrypted databases — Jet4 database passwords and ACE agile
+    ///     encryption (AES); supply the password via AccessReaderOptions.Password
+    ///   ✓ Linked tables — reported with their source, and readable when that source is another
+    ///     Access file
     ///   ✓ Streaming API — process millions of rows without OOM (StreamRows, ReadTableAsDataTable)
     ///   ✓ Progress reporting — IProgress&lt;int&gt; callbacks for long operations
     ///   ✓ Page cache — 256-page LRU cache (default 1 MB) for 50%+ performance boost
     ///   ✓ Catalog caching — single MSysObjects scan, reused across calls
     ///   ✓ Non-Western text — auto-detects code page from database header (Cyrillic, Japanese, etc.)
-    ///   ✓ Encryption detection — throws clear NotSupportedException for password-protected DBs
     ///
     /// Limitations:
-    ///   ✗ Encrypted (password-protected) databases — remove password in Access first
-    ///   ✗ Attachment fields (Type 0x11) — not supported (rare, added in Access 2007)
-    ///   ✗ Linked tables — only local tables returned
-    ///   ✗ Overflow rows (span multiple pages) — silently skipped (rare edge case)
+    ///   ✗ Complex columns (Type 0x12 — Attachment, Multi-Value, append-only Memo history):
+    ///     the 4-byte id stored in the row is surfaced, not the values it points at
+    ///   ✗ Linked tables whose source is not an Access file (ODBC, Excel, text) — listed, not read
+    ///   ✗ Write operations — this is a read-only library
     ///
     /// Based on the mdbtools format specification:
     ///   https://github.com/mdbtools/mdbtools/blob/master/HACKING.md
@@ -55,6 +60,13 @@ namespace JetDatabaseReader
         private const byte T_MEMO    = 0x0C; // LVAL or inline
         private const byte T_GUID    = 0x0F; // 16 bytes
         private const byte T_NUMERIC = 0x10; // 17 bytes scaled decimal
+
+        /// <summary>
+        /// A "complex" column — Attachment, Multi-Value, or append-only Memo history, all added in
+        /// Access 2007. The row itself holds only a 4-byte id; the values live in hidden system
+        /// tables keyed by it. Not resolved: the id is surfaced as-is rather than followed.
+        /// </summary>
+        private const byte T_COMPLEX = 0x12;
 
         // Catalog (MSysObjects) constants
         private const int  OBJ_TABLE        = 1;  // local table
@@ -1456,6 +1468,7 @@ namespace JetDatabaseReader
                 case T_MEMO:     return "Memo";
                 case T_GUID:     return "GUID";
                 case T_NUMERIC:  return "Decimal";
+                case T_COMPLEX:  return "Complex";
                 default:         return $"0x{t:X2}";
             }
         }

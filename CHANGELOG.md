@@ -28,6 +28,19 @@ repeatedly; on a 228 000-row read that cost **16% of allocations and 18% of peak
 count drifts after deletes, so it is treated strictly as a hint and ignored when implausible for
 the file's size.
 
+### 🧹 Complex columns now say what they are
+
+Attachment, Multi-Value and append-only Memo history columns share type code **`0x12`** — the docs
+said `0x11`, which is not a code Access uses. They keep their values in hidden system tables and
+leave only a 4-byte id in the row, and that id was being surfaced as a `string` under the type name
+`"0x12"`: Northwind's `Employees.Attachments` read as `"01-00-00-00"`.
+
+The reader still does not follow the id into those tables, but the column is now named `"Complex"`
+so a caller can tell it apart from data. The distinction matters because the id looks exactly like
+an ordinary value — 15 such columns exist across the databases on hand, including two in a fixture
+that is in this repository. Ordinary **OLE Object** columns are a different thing and are read in
+full, as before.
+
 ### 🐛 Unprotected Jet4 databases were refused as password-protected
 
 The stored database password at 0x42 is obfuscated **twice**: once with the fixed header mask, and
