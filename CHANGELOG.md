@@ -28,6 +28,33 @@ repeatedly; on a 228 000-row read that cost **16% of allocations and 18% of peak
 count drifts after deletes, so it is treated strictly as a hint and ignored when implausible for
 the file's size.
 
+### 🐛 Defects found by a review pass over this release
+
+Five, all of which had shipped green against the suite.
+
+- **`ListTables()` returned system tables under 66 cultures.** The catalog decides what is a user
+  table by parsing the object type and flags out of text, and did so with the ambient culture.
+  Sixty-six cultures — every Arabic locale among them — use a negative sign that is not `-`, and a
+  system table's flags are negative, so the parse failed, left zero, and the mask let it through.
+  Under `ar-SA` a one-table database listed **fifteen** tables, including `MSysObjects` and every
+  `MSysComplexType_*`. Like the formatting bug below, this predates the release.
+- **DECIMAL/NUMERIC columns read as empty.** A refactor left `ReadNumericValue` returning formatted
+  text instead of the decimal, so the string path blanked every value and the typed path put a
+  boxed string into a `typeof(decimal)` column.
+- **`ReadTableAsync` could not be cancelled once running.** Both `DataTable` paths accepted a
+  `CancellationToken` and never checked it; their loops sit inside the `BeginLoadData` try block and
+  were missed when the others were instrumented. The existing tests only covered the
+  already-cancelled case, which `Task.Run`'s pre-start check satisfies on its own.
+- **A rejected open leaked the file handle.** The constructor opens the file before it can decide to
+  reject it — wrong password, encrypted pages, not a JET database — and did not close it on the way
+  out. Retrying with a different password leaked one handle per attempt.
+- **The blocked catalog sweep aliased a page to the 1 MB block buffer**, widening the bounds clamps
+  that MEMO, NUMERIC and GUID decoding apply against `buffer.Length`. A malformed inline value on a
+  catalog page could read into the following pages of the block instead of being clamped.
+- **A non-JET file reported itself as encrypted.** Format validation now runs before the encryption
+  check, so junk gets `InvalidDataException` about the magic signature rather than a misleading
+  message about encryption.
+
 ### 🐛 String reads depended on the machine's locale
 
 `ReadTableAsStrings`, `StreamRowsAsStrings`, `ReadTableAsStringDataTable` and `ReadFirstTable`

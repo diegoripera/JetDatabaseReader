@@ -182,6 +182,12 @@ namespace JetDatabaseReader
             _fs = new FileStream(path, FileMode.Open, options.FileAccess, options.FileShare,
                                  options.FileBufferSize, FileOptions.SequentialScan);
 
+            // Everything past this point can reject the file — wrong password, encrypted pages,
+            // not a JET database at all. Without this the handle stays open until a collection,
+            // so a caller retrying with a different password leaks one per attempt.
+            try
+            {
+
             // Page 0 whole, not just the 0x80-byte header: an encrypted ACE database keeps this
             // page in plain text and stores its encryption descriptor further in, past 0x2A0.
             var hdr = new byte[Math.Min(4096, Math.Max(0x80, _fs.Length))];
@@ -282,6 +288,14 @@ namespace JetDatabaseReader
                 _varLenFldSz    =  1;
             }
 
+            // Format validation comes first: a file that is not a JET database at all should say
+            // so, rather than fall through to the encryption check and be reported as encrypted
+            // because its page 2 happens not to look like a TDEF.
+            if (options.ValidateOnOpen)
+            {
+                ValidateDatabaseFormat();
+            }
+
             // Page 2 always holds the MSysObjects table definition, so it doubles as the check
             // that pages are readable at all. When it is not a TDEF the pages are encrypted.
             if (!IsCatalogPageReadable())
@@ -296,10 +310,12 @@ namespace JetDatabaseReader
                         "encryption in Microsoft Access (File > Info > Decrypt Database).");
                 }
             }
-
-            if (options.ValidateOnOpen)
+            }
+            catch
             {
-                ValidateDatabaseFormat();
+                _crypto?.Dispose();
+                _fs.Dispose();
+                throw;
             }
         }
 
@@ -841,10 +857,20 @@ namespace JetDatabaseReader
                         if (owner != 2) continue;               // must belong to MSysObjects
                         catPages++;
 
-                        // Row decoding works from the start of a page, so lift this one out of
-                        // the block. There are only a handful of catalog pages.
-                        if (at != 0) Buffer.BlockCopy(page, at, scan, 0, _pgSz);
-                        byte[] catalogPage = at == 0 ? page : scan;
+                        // Row decoding requires a buffer that is exactly one page: MEMO, NUMERIC
+                        // and GUID decoding clamp against buffer.Length, and handing them the
+                        // whole block would widen those bounds into the following pages. Always
+                        // lift the page out — there are only a handful of catalog pages.
+                        byte[] catalogPage;
+                        if (block != null)
+                        {
+                            Buffer.BlockCopy(block, at, scan, 0, _pgSz);
+                            catalogPage = scan;
+                        }
+                        else
+                        {
+                            catalogPage = page;
+                        }
 
                     foreach (RowSpan span in EnumerateRowSpans(catalogPage, catScanner))
                     {
@@ -855,7 +881,13 @@ namespace JetDatabaseReader
                         string nameStr  = SafeGet(catRow, idxName);
                         string flagsStr = SafeGet(catRow, idxFlags);
 
-                        if (!int.TryParse(typeStr, out int objType)) continue;
+                        // Invariant parsing, to match the invariant text these values were
+                        // written as. Sixty-six cultures use a negative sign that is not '-',
+                        // and under those the parse fails: a system table's flags have the high
+                        // bit set, so they format negative, and a failed parse leaves zero —
+                        // which passes the mask below and lists the system table as a user one.
+                        if (!int.TryParse(typeStr, NumberStyles.Integer, CultureInfo.InvariantCulture,
+                                          out int objType)) continue;
 
                         objectTypes.TryGetValue(objType, out int seen);
                         objectTypes[objType] = seen + 1;
@@ -863,7 +895,8 @@ namespace JetDatabaseReader
                         bool isLinked = objType == OBJ_LINKED || objType == OBJ_LINKED_ODBC;
                         if (objType != OBJ_TABLE && !isLinked) continue;
 
-                        long.TryParse(flagsStr, out long flagsLong);
+                        long.TryParse(flagsStr, NumberStyles.Integer, CultureInfo.InvariantCulture,
+                                      out long flagsLong);
                         if (((uint)flagsLong & SYSTABLE_MASK) != 0)
                             continue;
 
@@ -885,7 +918,8 @@ namespace JetDatabaseReader
                         long tdefPage = 0;
                         if (idxId >= 0)
                         {
-                            long.TryParse(SafeGet(catRow, idxId), out long id);
+                            long.TryParse(SafeGet(catRow, idxId), NumberStyles.Integer,
+                                          CultureInfo.InvariantCulture, out long id);
                             tdefPage = id & 0x00FFFFFFL;
                         }
 
@@ -1647,6 +1681,8 @@ namespace JetDatabaseReader
             {
                 foreach (long p in EnumerateTablePages(entry.TDefPage))
                 {
+                    cancellationToken.ThrowIfCancellationRequested();
+
                     byte[] page = ReadPageForScan(p, scan);
                     if (page[0] != 0x01) continue;
                     if ((long)Ri32(page, _dpTDefOff) != entry.TDefPage) continue;
@@ -1904,6 +1940,8 @@ namespace JetDatabaseReader
             {
                 foreach (long p in EnumerateTablePages(entry.TDefPage))
                 {
+                    cancellationToken.ThrowIfCancellationRequested();
+
                     byte[] page = ReadPageForScan(p, scan);
                     if (page[0] != 0x01) continue;
                     if ((long)Ri32(page, _dpTDefOff) != entry.TDefPage) continue;
@@ -2968,7 +3006,10 @@ namespace JetDatabaseReader
 
             try
             {
-                return new decimal((int)lo, (int)mid, (int)hi, neg, scale).ToString("G", CultureInfo.InvariantCulture);
+                // Returns the decimal itself. Formatting belongs to ReadNumeric, which is the
+                // string path; returning text from here made every DECIMAL column read as an
+                // empty string and put a boxed string into a typeof(decimal) DataTable column.
+                return new decimal((int)lo, (int)mid, (int)hi, neg, scale);
             }
             catch (OverflowException ex)
             {

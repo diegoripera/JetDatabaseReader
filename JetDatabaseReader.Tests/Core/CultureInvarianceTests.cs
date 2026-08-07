@@ -65,6 +65,30 @@ namespace JetDatabaseReader.Tests
         }
 
         [Theory]
+        [MemberData(nameof(TestDatabases.All), MemberType = typeof(TestDatabases))]
+        public void TheTableList_IsIdenticalAcrossCultures(string path)
+        {
+            List<string> reference = null;
+
+            foreach (string culture in Cultures)
+            {
+                Use(culture);
+
+                using var reader = TestDatabases.Open(path);
+                List<string> tables = reader.ListTables().OrderBy(t => t, StringComparer.Ordinal).ToList();
+
+                if (reference == null) { reference = tables; continue; }
+
+                // The catalog decides what is a user table by parsing the object type and flags
+                // out of text. Sixty-six cultures use a negative sign that is not '-', and a
+                // system table's flags are negative — so a culture-sensitive parse silently
+                // failed there, left zero, and let the system table through the mask.
+                tables.Should().Equal(reference,
+                    because: $"the set of user tables must not depend on the culture ({culture})");
+            }
+        }
+
+        [Theory]
         [MemberData(nameof(TestDatabases.Small), MemberType = typeof(TestDatabases))]
         public void DatesAndNumbers_RoundTripThroughInvariantParsing(string path)
         {

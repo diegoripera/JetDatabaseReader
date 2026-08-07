@@ -228,16 +228,5 @@ namespace JetDatabaseReader.Tests
 
         // ── Helpers ───────────────────────────────────────────────────────
 
-        /// <summary>
-        /// Synchronous IProgress&lt;T&gt; that invokes the callback directly on the reporting
-        /// thread. Use in tests instead of Progress&lt;T&gt; to avoid thread-pool dispatch races
-        /// when asserting the collected values immediately after iteration.
-        /// </summary>
-        private sealed class SyncProgress<T> : IProgress<T>
-        {
-            private readonly Action<T> _action;
-            public SyncProgress(Action<T> action) => _action = action;
-            public void Report(T value) => _action(value);
-        }
     }
 }
