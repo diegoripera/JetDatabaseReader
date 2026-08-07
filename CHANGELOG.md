@@ -28,6 +28,25 @@ repeatedly; on a 228 000-row read that cost **16% of allocations and 18% of peak
 count drifts after deletes, so it is treated strictly as a hint and ignored when implausible for
 the file's size.
 
+### ⚠️ The page sweep returns rows Access does not — open
+
+Not fixed. Recorded because it is a correctness issue and it reverses an earlier decision.
+
+Pages are found by sweeping the file for data pages whose `tdef_pg` names the table. On the 2 GB
+sample database that yields **1 677 013 rows where Access yields 1 610 849** — every row Access
+has, plus **66 164 extra ones**, all distinct, none a duplicate of anything. They sit on pages
+still tagged with the table's TDEF that the table no longer owns, and Access knows that because it
+consults the table's usage map instead of trusting the tag.
+
+Nothing is missing; the risk is the other direction. A report built on this table would be
+inflated by 4% with rows the database does not contain, which is worse than an error, because it
+looks like data.
+
+The fix is to enumerate pages from the table's usage map rather than by sweeping — the approach
+this project measured and rejected on the strength of that same 66 164 figure, read backwards. It
+is a real change to how every read finds its pages, and to the performance work built on the sweep,
+so it is written down here rather than done in passing.
+
 ### 🐛 Five ways the reader disagreed with Access
 
 Every check up to this point compared the library's two read paths against each other. That cannot
@@ -258,10 +277,17 @@ added to do, which until now had only been asserted.
 Three strategies were tried and **rejected on measurement**, which is worth recording so they are
 not tried again:
 
-- **Usage maps instead of the page sweep.** JET stores a per-table bitmap of owned pages, and
-  using it would have made opening a 2 GB database nearly free. It is stale on real files: on the
+- ~~**Usage maps instead of the page sweep.**~~ **This conclusion was wrong — see below.** It was
+  recorded as: "JET stores a per-table bitmap of owned pages … it is stale on real files: on the
   2 GB database it omits 94 657 pages of one table, some carrying live rows. Trusting it would
-  silently drop 66 164 rows.
+  silently drop 66 164 rows."
+
+  Those 66 164 rows are not live. Access does not return them: asked for the same table, ACE OLEDB
+  yields 1 610 849 rows and the sweep yields 1 677 013 — every row Access has, plus 66 164 distinct
+  extra ones that are not duplicates of anything. The usage map was right and the sweep is what is
+  wrong; the earlier measurement had no oracle and treated the sweep as ground truth, so it read
+  the map's omissions as data loss when they were the map excluding pages the table no longer owns.
+  See "The page sweep returns rows Access does not" below.
 - **Memory-mapping the file for the sweep.** Allocates nothing, but measured 2× slower than block
   reads (1717 ms vs 841 ms over 2 GB) — the accessors bounds-check every call.
 - **Hand-rolled CBC over a reused ECB transform.** Avoids a per-page cipher object but is 4×
