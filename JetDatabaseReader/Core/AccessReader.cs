@@ -2975,7 +2975,19 @@ namespace JetDatabaseReader
             // InvariantCulture is not cosmetic here: a culture whose default calendar is not
             // Gregorian renders a different date entirely. Under th-TH this same value came out
             // as 2541-06-01 instead of 1998-06-01, and under ar-SA as 1419-02-07.
-            try   { return DateTime.FromOADate(oaDate).ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture); }
+            try
+            {
+                DateTime value = DateTime.FromOADate(oaDate);
+
+                // A fixed "HH:mm:ss" silently dropped the fractional second, which JET does store:
+                // 220 of 1226 date cells in the test databases lost theirs. The fraction is only
+                // appended when there is one, so whole-second dates render exactly as before.
+                string format = value.Ticks % TimeSpan.TicksPerSecond == 0
+                    ? "yyyy-MM-dd HH:mm:ss"
+                    : "yyyy-MM-dd HH:mm:ss.FFFFFFF";
+
+                return value.ToString(format, CultureInfo.InvariantCulture);
+            }
             catch { return string.Empty; }
         }
 

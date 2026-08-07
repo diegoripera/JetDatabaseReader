@@ -35,6 +35,17 @@ the file's size.
 registering for dependency injection — could not tell whether a database was encrypted or discover
 its linked tables. All four are now on the interface.
 
+### 🐛 Date text dropped the fractional second
+
+The string path rendered dates with a fixed `"yyyy-MM-dd HH:mm:ss"`, which has no room for the
+fraction JET actually stores: **220 of 1 226 date cells** across the test databases lost theirs, so
+`2004-03-11T10:01:36.827` came back as `"2004-03-11 10:01:36"`. Unlike the floating-point loss this
+happened on every runtime, and it predates the release.
+
+The fraction is now appended only when there is one, so a whole-second date renders exactly as it
+always did and nothing else changes. A test parses the text back and requires it to equal the typed
+instant.
+
 ### 🐛 Floating-point text lost precision on .NET Framework
 
 `float` and `double` on the string path used the `"G"` format. On .NET Core that is the shortest

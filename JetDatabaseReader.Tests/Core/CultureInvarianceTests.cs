@@ -161,6 +161,41 @@ namespace JetDatabaseReader.Tests
             }
         }
 
+        [Theory]
+        [MemberData(nameof(TestDatabases.All), MemberType = typeof(TestDatabases))]
+        public void DateText_RoundTripsToTheTypedValue(string path)
+        {
+            using var reader = TestDatabases.Open(path);
+
+            foreach (TableStat stat in reader.GetTableStats().Where(s => s.ColumnCount > 0).Take(6))
+            {
+                List<ColumnMetadata> meta = reader.GetColumnMetadata(stat.Name);
+                List<int> dates = meta.Select((m, i) => new { m, i })
+                                      .Where(x => x.m.ClrType == typeof(DateTime))
+                                      .Select(x => x.i).ToList();
+                if (dates.Count == 0) continue;
+
+                List<object[]> typed = reader.StreamRows(stat.Name).Take(200).ToList();
+                List<string[]> text = reader.StreamRowsAsStrings(stat.Name).Take(200).ToList();
+
+                for (int r = 0; r < typed.Count; r++)
+                {
+                    foreach (int c in dates)
+                    {
+                        if (typed[r][c] == DBNull.Value) continue;
+
+                        // A fixed "HH:mm:ss" dropped the fractional second JET actually stores.
+                        var expected = (DateTime)typed[r][c];
+                        DateTime parsed = DateTime.Parse(text[r][c], CultureInfo.InvariantCulture,
+                                                         DateTimeStyles.None);
+
+                        parsed.Should().Be(expected,
+                            because: $"'{stat.Name}'.{meta[c].Name} text must recover the stored instant");
+                    }
+                }
+            }
+        }
+
         [Fact]
         public void Dates_KeepTheGregorianYear_UnderANonGregorianCalendar()
         {
