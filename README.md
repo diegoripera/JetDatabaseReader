@@ -339,7 +339,7 @@ catch (ObjectDisposedException) { /* reader already disposed */ }
 | | |
 |---|---|
 | ✅ Jet4 database password (`.mdb`) | Supply it via `AccessReaderOptions.Password` |
-| ❌ ACE encryption (`.accdb`) | "Encrypt with Password" really encrypts the pages — decrypt in Access first |
+| ✅ ACE encryption (`.accdb`) | Agile encryption (AES) — supply the password the same way |
 | ❌ Attachment fields (0x11) | Rare type added in Access 2007 |
 | ⚠️ Linked tables | Listed with their source; readable only when the source is another Access file |
 | ❌ Write operations | Read-only library |
@@ -381,11 +381,14 @@ reader.IsPasswordProtected;   // true
 A **Jet4 database password** (Access 2000–2003, `.mdb`) is access control, not encryption: Access
 refuses to open the file, but the page bodies sit on disk in plain text. This library verifies the
 password and then reads normally — it is not decrypting anything, and any tool reading the file
-directly sees the same data. Treat such a file as unprotected at rest. Access also truncates these
-passwords to 20 characters when they are set, so a longer one is compared on the same terms.
+directly sees the same data. Treat such a file as unprotected at rest.
 
-**ACE encryption** (Access 2007+, `.accdb`, "Encrypt with Password") genuinely encrypts the pages
-and is not supported; opening one throws a `NotSupportedException` saying so.
+**ACE encryption** (Access 2010+, `.accdb`, "Encrypt with Password") is the real thing: ECMA-376
+agile encryption with AES, and the pages are decrypted as they are read. `reader.IsEncrypted` tells
+the two cases apart.
+
+Access truncates a database password to 20 characters when it is set, so a longer password is
+compared and derived on the same terms — you can pass either form.
 
 > **Overflow rows are now supported.** A row-offset entry with bit `0x4000` is a pointer to the
 > page and row actually holding the data; these used to be skipped. It mattered most in

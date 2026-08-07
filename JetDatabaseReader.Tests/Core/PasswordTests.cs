@@ -127,32 +127,21 @@ namespace JetDatabaseReader.Tests
         // ── ACE encryption (.accdb) ───────────────────────────────────────
 
         [Fact]
-        public void AceEncrypted_CorrectPassword_PassesTheFormatsOwnVerifier()
+        public void AceEncrypted_WithCorrectPassword_Opens()
         {
             if (!File.Exists(AceEncryptedDb)) return;
 
-            // Agile encryption stores a verifier, so getting past it is proof the key derivation
-            // is right — a wrong key cannot produce a matching verifier hash. Decryption then
-            // fails later, on the page IV, which is a different and clearly-named failure.
-            Action act = () => AccessReader.Open(AceEncryptedDb, new AccessReaderOptions { Password = Password });
-
-            act.Should().Throw<NotSupportedException>()
-               .WithMessage("*password was accepted*",
-                   because: "the key is correct; only the per-page IV derivation is unresolved");
-        }
-
-        [Fact(Skip = "ACE page IV derivation unresolved — see CHANGELOG. Key derivation is verified.")]
-        public void AceEncrypted_WithCorrectPassword_Opens()
-        {
             using var reader = AccessReader.Open(AceEncryptedDb, new AccessReaderOptions { Password = Password });
 
             reader.IsEncrypted.Should().BeTrue();
             reader.ListTables().Should().NotBeEmpty();
         }
 
-        [Fact(Skip = "ACE page IV derivation unresolved — see CHANGELOG. Key derivation is verified.")]
+        [Fact]
         public void AceEncrypted_DecryptsToTheSameDataAsThePlainTwin()
         {
+            if (!File.Exists(AceEncryptedDb) || !TestDatabases.IsReadable(TestDatabases.NorthwindTraders)) return;
+
             using var plain = AccessReader.Open(TestDatabases.NorthwindTraders);
             using var encrypted = AccessReader.Open(AceEncryptedDb, new AccessReaderOptions { Password = Password });
 

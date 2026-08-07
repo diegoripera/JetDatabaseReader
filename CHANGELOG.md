@@ -177,32 +177,37 @@ of the seventeenth character. It behaved like a flag only because an unset passw
 mask's own value there, and would have misreported for passwords whose seventeenth character
 cleared those bits.
 
-### 🚧 ACE encryption (`.accdb`) — key derivation done, page decryption not
+### ✨ ACE encryption (`.accdb`) — supported
 
-Partial. The scheme is identified and the hard cryptography works; one derivation step remains.
+Encrypted databases now open with `AccessReaderOptions.Password`, and `AccessReader.IsEncrypted`
+reports whether pages are being decrypted. Unlike a Jet4 database password, this is real
+encryption: the pages are ciphertext and are decrypted as they are read.
 
-The fixture uses **ECMA-376 agile encryption**: AES-256-CBC, SHA-512, spin count 100 000, with the
-descriptor sitting in plain text in page 0. `AgileEncryption` implements the MS-OFFCRYPTO key
-derivation — iterated password hashing, the verifier, and unwrapping the package key.
+The scheme is **ECMA-376 agile encryption** — AES-256-CBC, SHA-512, spin count 100 000 — with the
+descriptor sitting in plain text in page 0. Key derivation follows MS-OFFCRYPTO: iterated password
+hashing, the verifier, and unwrapping the package key.
 
-Two things are established rather than assumed:
+**Access departs from the specification in one place, and it is the whole difficulty.**
+MS-OFFCRYPTO says a segment's `blockKey` is its zero-based index. Access instead uses
+`encodingKey XOR pageNumber`, where the encoding key is four bytes at offset `0x3E` — themselves
+XOR-masked like the rest of the Jet header. An unencrypted database stores zero there, so the mask
+is just what such a file contains; two unrelated unencrypted databases (one `.mdb`, one `.accdb`)
+both hold `FB 8A BC 4E`, which is where that constant comes from.
 
-- **The password is right.** The format carries a verifier, so passing it is proof, not inference.
-  Access truncates the password to 20 characters here as well, so a longer one is retried
-  truncated — found by testing candidates against the verifier.
-- **The package key is right.** Pages 2, 3, and 4 decrypt byte-identical to the unencrypted twin
-  from offset 16 onward. In CBC a wrong IV corrupts only the first block, so a correct tail proves
-  the key while isolating the fault to the IV.
+How this was pinned down, since guessing at a cipher is worthless:
 
-What is unresolved is how each page's IV is derived. It is not the OOXML segment rule
-`H(salt ‖ LE32(index))` (swept over 300 000 indices, several hash and byte-order variants), not the
-salt itself, not chained CBC from the previous page, and it is not stored anywhere in the file.
-Page numbers map 1:1 to segments, which the matching tails confirm.
+1. The unencrypted twin supplies the plaintext, so each page's true IV is *computed* rather than
+   guessed: `IV = ECB_decrypt(cipher_block0) XOR plain_block0`.
+2. In CBC a wrong IV corrupts only the first block. Pages 2–5 decrypting byte-identical from
+   offset 16 onward proved the package key was already correct and isolated the fault to the IV.
+3. The recovered IVs matched none of the specification's forms, which is what pointed at Access
+   deviating rather than at a bug in the derivation.
 
-Until that is settled, opening an encrypted `.accdb` with the correct password throws a
-`NotSupportedException` saying the password was accepted but the pages did not decrypt — distinct
-from the wrong-password error. Two tests carrying the end-to-end assertions are present and
-skipped, ready to run when the derivation is found.
+Verified by decrypting the whole database and comparing every row of every table against the
+unencrypted twin — decryption is only correct if it reproduces the original exactly.
+
+Access truncates the password to 20 characters for `.accdb` as well, so a longer one is retried
+truncated; the format's verifier makes that a definite test rather than a guess.
 
 ### 🐛 Encrypted `.accdb` reported an empty database instead of an error
 

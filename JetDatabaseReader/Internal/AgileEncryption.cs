@@ -25,17 +25,45 @@ namespace JetDatabaseReader
         private static readonly byte[] BlockKeyVerifierValue = { 0xD7, 0xAA, 0x0F, 0x6D, 0x30, 0x61, 0x34, 0x4E };
         private static readonly byte[] BlockKeySecretKey     = { 0x14, 0x6E, 0x0B, 0xE7, 0xAB, 0xAC, 0xD0, 0xD6 };
 
+        /// <summary>
+        /// Offset of the database's encoding key, and the fixed value the header masks it with.
+        ///
+        /// Access departs from the specification here. MS-OFFCRYPTO says a segment's blockKey is
+        /// its zero-based index; Access instead uses <c>encodingKey XOR pageNumber</c>. The
+        /// encoding key sits at 0x3E, XOR-masked like the rest of the Jet header — an unencrypted
+        /// database stores zero there, so the mask is simply what such a file contains. Two
+        /// unrelated unencrypted databases (one .mdb, one .accdb) both hold FB 8A BC 4E, which is
+        /// how this constant was obtained.
+        /// </summary>
+        private const int EncodingKeyOffset = 0x3E;
+        private static readonly byte[] EncodingKeyMask = { 0xFB, 0x8A, 0xBC, 0x4E };
+
         private readonly byte[] _packageKey;   // decrypts the data
-        private readonly byte[] _dataSalt;     // seeds each segment's IV
+        private readonly byte[] _dataSalt;     // seeds each page's IV
         private readonly string _dataHash;
         private readonly int _dataBlockSize;
+        private readonly uint _encodingKey;
 
-        private AgileEncryption(byte[] packageKey, byte[] dataSalt, string dataHash, int dataBlockSize)
+        private AgileEncryption(byte[] packageKey, byte[] dataSalt, string dataHash,
+                                int dataBlockSize, uint encodingKey)
         {
             _packageKey = packageKey;
             _dataSalt = dataSalt;
             _dataHash = dataHash;
             _dataBlockSize = dataBlockSize;
+            _encodingKey = encodingKey;
+        }
+
+        /// <summary>Reads the database's encoding key out of page 0, undoing the header mask.</summary>
+        public static uint ReadEncodingKey(byte[] page0)
+        {
+            if (page0 == null || page0.Length < EncodingKeyOffset + 4) return 0;
+
+            uint key = 0;
+            for (int i = 3; i >= 0; i--)
+                key = (key << 8) | (uint)(page0[EncodingKeyOffset + i] ^ EncodingKeyMask[i]);
+
+            return key;
         }
 
         /// <summary>Finds the descriptor in page 0, or null when the page holds no agile descriptor.</summary>
@@ -65,18 +93,18 @@ namespace JetDatabaseReader
         /// </summary>
         private const int AccessPasswordLimit = 20;
 
-        public static AgileEncryption Create(string descriptorXml, string password)
+        public static AgileEncryption Create(string descriptorXml, string password, uint encodingKey)
         {
-            AgileEncryption result = CreateWith(descriptorXml, password ?? string.Empty);
+            AgileEncryption result = CreateWith(descriptorXml, password ?? string.Empty, encodingKey);
             if (result != null) return result;
 
             if (password != null && password.Length > AccessPasswordLimit)
-                return CreateWith(descriptorXml, password.Substring(0, AccessPasswordLimit));
+                return CreateWith(descriptorXml, password.Substring(0, AccessPasswordLimit), encodingKey);
 
             return null;
         }
 
-        private static AgileEncryption CreateWith(string descriptorXml, string password)
+        private static AgileEncryption CreateWith(string descriptorXml, string password, uint encodingKey)
         {
             var doc = new XmlDocument { XmlResolver = null };
             doc.LoadXml(descriptorXml);
@@ -137,24 +165,28 @@ namespace JetDatabaseReader
             int wanted = AttrInt(keyData, "keyBits") / 8;
             if (packageKey.Length > wanted) Array.Resize(ref packageKey, wanted);
 
-            return new AgileEncryption(packageKey, dataSalt, dataHash, dataBlockSize);
+            return new AgileEncryption(packageKey, dataSalt, dataHash, dataBlockSize, encodingKey);
         }
 
         /// <summary>
-        /// Decrypts one segment in place. Each page is its own segment, keyed by page number, so
-        /// pages stay independently readable — which is what lets the reader keep seeking freely.
+        /// Decrypts one page in place. Every page is its own CBC unit with its own IV, so pages
+        /// stay independently readable and the reader can keep seeking freely.
         /// </summary>
-        public void DecryptSegment(byte[] buffer, int length, long segmentIndex)
+        public void DecryptPage(byte[] buffer, int length, long pageNumber)
         {
             if (length <= 0) return;
 
-            // IV = H(dataSalt + LE32(index)), truncated to the cipher's block size.
+            // IV = H(dataSalt + LE32(blockKey)) truncated to the block size, where blockKey is
+            // encodingKey XOR pageNumber rather than the plain segment index the specification
+            // describes.
+            uint blockKey = _encodingKey ^ (uint)pageNumber;
+
             byte[] iv;
             using (HashAlgorithm h = CreateHash(_dataHash))
             {
                 var seed = new byte[_dataSalt.Length + 4];
                 Buffer.BlockCopy(_dataSalt, 0, seed, 0, _dataSalt.Length);
-                WriteLe32(seed, _dataSalt.Length, (uint)segmentIndex);
+                WriteLe32(seed, _dataSalt.Length, blockKey);
 
                 iv = h.ComputeHash(seed);
             }

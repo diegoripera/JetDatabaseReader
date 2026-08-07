@@ -130,9 +130,6 @@ namespace JetDatabaseReader
         /// <summary>Page decryptor for an encrypted ACE database; null when pages are plain text.</summary>
         private AgileEncryption _crypto;
 
-        /// <summary>Difference between a page number and its encryption segment index.</summary>
-        private int _segmentOffset;
-
         /// <summary>When true, GetUserTables logs verbose hex dumps for debugging. Default: false.</summary>
         public bool DiagnosticsEnabled { get; set; }
 
@@ -323,23 +320,18 @@ namespace JetDatabaseReader
             }
         }
 
-        /// <summary>True when page 2 decodes to a TDEF, which is what an unencrypted database gives.</summary>
+        /// <summary>True when page 2 decodes to a TDEF, which is what a readable database gives.</summary>
         private bool IsCatalogPageReadable()
         {
             var page = new byte[_pgSz];
             _fs.Seek(2L * _pgSz, SeekOrigin.Begin);
             ReadFully(page, _pgSz);
 
-            _crypto?.DecryptSegment(page, _pgSz, 2 + _segmentOffset);
+            _crypto?.DecryptPage(page, _pgSz, 2);
             return page[0] == 0x02;
         }
 
-        /// <summary>
-        /// Derives the page key from the password, then works out how page numbers map onto
-        /// encryption segments by decrypting page 2 and seeing which mapping yields a TDEF.
-        /// The specification numbers segments within an encrypted stream; which page that stream
-        /// starts at is exactly the sort of detail worth confirming rather than assuming.
-        /// </summary>
+        /// <summary>Derives the page key from the password and confirms it decrypts the catalog.</summary>
         private void SetUpDecryption(byte[] page0, string password)
         {
             string descriptor = AgileEncryption.FindDescriptor(page0);
@@ -349,23 +341,13 @@ namespace JetDatabaseReader
                 throw new InvalidOperationException(
                     "This database is encrypted. Supply the password via AccessReaderOptions.Password.");
 
-            AgileEncryption crypto = AgileEncryption.Create(descriptor, password);
+            AgileEncryption crypto = AgileEncryption.Create(
+                descriptor, password, AgileEncryption.ReadEncodingKey(page0));
+
             if (crypto == null)
                 throw new InvalidOperationException("The supplied password does not match this database's password.");
 
             _crypto = crypto;
-
-            foreach (int candidate in new[] { 0, -1 })
-            {
-                _segmentOffset = candidate;
-                if (IsCatalogPageReadable()) return;
-            }
-
-            _crypto = null;
-            _segmentOffset = 0;
-            throw new NotSupportedException(
-                "The password was accepted but the pages did not decrypt to a readable catalog. " +
-                "This database may use a page layout this library does not handle.");
         }
 
         /// <summary>
@@ -521,7 +503,7 @@ namespace JetDatabaseReader
             if (read < _pgSz) Array.Clear(buf, read, _pgSz - read);
 
             // Page 0 carries the header and the encryption descriptor and is never encrypted.
-            if (_crypto != null && n > 0) _crypto.DecryptSegment(buf, _pgSz, n + _segmentOffset);
+            if (_crypto != null && n > 0) _crypto.DecryptPage(buf, _pgSz, n);
         }
 
         /// <summary>
