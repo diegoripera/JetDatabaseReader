@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Data;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Text;
@@ -2546,19 +2547,19 @@ namespace JetDatabaseReader
                 switch (col.Type)
                 {
                     case T_BYTE:
-                        return row[start].ToString();
+                        return row[start].ToString(CultureInfo.InvariantCulture);
                     case T_INT:
-                        return ((short)Ru16(row, start)).ToString();
+                        return ((short)Ru16(row, start)).ToString(CultureInfo.InvariantCulture);
                     case T_LONG:
-                        return Ri32(row, start).ToString();
+                        return Ri32(row, start).ToString(CultureInfo.InvariantCulture);
                     case T_FLOAT:
-                        return BitConverter.ToSingle(row, start).ToString("G");
+                        return BitConverter.ToSingle(row, start).ToString("G", CultureInfo.InvariantCulture);
                     case T_DOUBLE:
-                        return BitConverter.ToDouble(row, start).ToString("G");
+                        return BitConverter.ToDouble(row, start).ToString("G", CultureInfo.InvariantCulture);
                     case T_DATETIME:
                         return OaDateToString(BitConverter.ToDouble(row, start));
                     case T_MONEY:
-                        return (BitConverter.ToInt64(row, start) / 10000.0m).ToString("F4");
+                        return MoneyToDecimal(BitConverter.ToInt64(row, start)).ToString("F4", CultureInfo.InvariantCulture);
                     case T_NUMERIC:
                         return ReadNumeric(row, start);
                     case T_GUID:
@@ -2927,7 +2928,10 @@ namespace JetDatabaseReader
 
         private static string OaDateToString(double oaDate)
         {
-            try   { return DateTime.FromOADate(oaDate).ToString("yyyy-MM-dd HH:mm:ss"); }
+            // InvariantCulture is not cosmetic here: a culture whose default calendar is not
+            // Gregorian renders a different date entirely. Under th-TH this same value came out
+            // as 2541-06-01 instead of 1998-06-01, and under ar-SA as 1419-02-07.
+            try   { return DateTime.FromOADate(oaDate).ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture); }
             catch { return string.Empty; }
         }
 
@@ -2940,7 +2944,7 @@ namespace JetDatabaseReader
         private static string ReadNumeric(byte[] b, int start)
         {
             object v = ReadNumericValue(b, start);
-            return v is decimal d ? d.ToString("G") : string.Empty;
+            return v is decimal d ? d.ToString("G", CultureInfo.InvariantCulture) : string.Empty;
         }
 
         /// <summary>
@@ -2964,7 +2968,7 @@ namespace JetDatabaseReader
 
             try
             {
-                return new decimal((int)lo, (int)mid, (int)hi, neg, scale).ToString("G");
+                return new decimal((int)lo, (int)mid, (int)hi, neg, scale).ToString("G", CultureInfo.InvariantCulture);
             }
             catch (OverflowException ex)
             {
@@ -2977,7 +2981,7 @@ namespace JetDatabaseReader
         {
             if (start + 16 > b.Length) return string.Empty;
             // First three groups are stored little-endian in the Jet format
-            return string.Format(
+            return string.Format(CultureInfo.InvariantCulture,
                 "{{{0:X2}{1:X2}{2:X2}{3:X2}-{4:X2}{5:X2}-{6:X2}{7:X2}" +
                 "-{8:X2}{9:X2}-{10:X2}{11:X2}{12:X2}{13:X2}{14:X2}{15:X2}}}",
                 b[start+3], b[start+2], b[start+1], b[start],

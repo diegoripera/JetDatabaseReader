@@ -28,6 +28,25 @@ repeatedly; on a 228 000-row read that cost **16% of allocations and 18% of peak
 count drifts after deletes, so it is treated strictly as a hint and ignored when implausible for
 the file's size.
 
+### 🐛 String reads depended on the machine's locale
+
+`ReadTableAsStrings`, `StreamRowsAsStrings`, `ReadTableAsStringDataTable` and `ReadFirstTable`
+formatted numbers and dates with the ambient culture, so the same database produced different text
+on different machines. Under a Spanish or German locale `1059.3100` came back as `1059,3100`; under
+`ar-SA` the decimal separator was U+066B, which no invariant parser accepts.
+
+Dates were worse than a formatting nuisance — they were **wrong**. The format string was explicit
+but the calendar was not, so a culture whose default calendar is not Gregorian rendered a different
+date: `1998-06-01` became `2541-06-01` under `th-TH` and `1419-02-07` under `ar-SA`.
+
+Every value the string path produces is now formatted with `InvariantCulture`, as is
+`ColumnSize.ToString()`, which ends up in schema output. The typed path was already unaffected —
+it stopped going through strings earlier in this release.
+
+Regression tests read the same table under en-US, es-ES, de-DE, th-TH and ar-SA and require
+byte-identical output, plus that every date and number parses back invariantly. They fail against
+the previous behaviour on all three counts.
+
 `Query(t).Count()` no longer copies every row out only to discard it. Streaming copies each row
 because the caller may keep it; counting keeps nothing, so with no predicate to run there is
 nothing to copy for. Rows are still decoded and validated exactly as `Execute()` does — the count
