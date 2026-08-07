@@ -539,6 +539,27 @@ namespace JetDatabaseReader
         /// <summary>Allocates one page-sized scratch buffer for the duration of a scan.</summary>
         private byte[] NewScanBuffer() => new byte[_pgSz];
 
+        /// <summary>Pages read at a time when sweeping the file for the catalog. 256 pages = 1 MB.</summary>
+        private const int ScanBlockPages = 256;
+
+        /// <summary>Reads <paramref name="bytes"/> bytes starting at <paramref name="firstPage"/>.</summary>
+        private void ReadBlock(long firstPage, byte[] buffer, int bytes)
+        {
+            int read = 0;
+            lock (_ioLock)
+            {
+                _fs.Seek(firstPage * _pgSz, SeekOrigin.Begin);
+                while (read < bytes)
+                {
+                    int got = _fs.Read(buffer, read, bytes - read);
+                    if (got == 0) break;
+                    read += got;
+                }
+            }
+
+            if (read < bytes) Array.Clear(buffer, read, bytes - read);
+        }
+
         /// <summary>Reads a page through the cache if enabled (PageCacheSize > 0).</summary>
         private byte[] ReadPageCached(long n)
         {
@@ -781,26 +802,50 @@ namespace JetDatabaseReader
                 var catScanner = new RowScanner();
                 var catRow = new string[msysShape.Width];
 
+                // This scan only needs eight bytes out of every page — the type and the owning
+                // TDEF — but it has to visit them all. Reading a page at a time means one copy
+                // per page out of the FileStream buffer; reading in blocks and inspecting the
+                // headers where they land removes that copy for all but the catalog's own pages,
+                // which are the only ones whose body is actually used here.
                 byte[] scan = NewScanBuffer();
-                for (long p = 3; p < totPages; p++)
+                byte[] block = _crypto == null ? new byte[ScanBlockPages * _pgSz] : null;
+
+                for (long first = 3; first < totPages; first += ScanBlockPages)
                 {
-                    byte[] page = ReadPageForScan(p, scan);
-                    if (page[0] != 0x01) continue;             // data pages only
+                    int inBlock = (int)Math.Min(ScanBlockPages, totPages - first);
+                    if (block != null) ReadBlock(first, block, inBlock * _pgSz);
 
-                    // Same expression the read loops compare against, so the index is an exact
-                    // memoization of their filter — not a heuristic that could miss pages.
-                    long owner = Ri32(page, _dpTDefOff);
-                    if (!index.TryGetValue(owner, out List<PageRun> runs))
+                    for (int i = 0; i < inBlock; i++)
                     {
-                        runs = new List<PageRun>();
-                        index[owner] = runs;
-                    }
-                    AppendPage(runs, p);
+                        long p = first + i;
 
-                    if (owner != 2) continue;                  // must belong to MSysObjects
-                    catPages++;
+                        // Encrypted databases decrypt page by page, so they keep the simple path.
+                        byte[] page;
+                        int at;
+                        if (block != null) { page = block; at = i * _pgSz; }
+                        else { page = ReadPageForScan(p, scan); at = 0; }
 
-                    foreach (RowSpan span in EnumerateRowSpans(page, catScanner))
+                        if (page[at] != 0x01) continue;         // data pages only
+
+                        // Same expression the read loops compare against, so the index is an exact
+                        // memoization of their filter — not a heuristic that could miss pages.
+                        long owner = Ri32(page, at + _dpTDefOff);
+                        if (!index.TryGetValue(owner, out List<PageRun> runs))
+                        {
+                            runs = new List<PageRun>();
+                            index[owner] = runs;
+                        }
+                        AppendPage(runs, p);
+
+                        if (owner != 2) continue;               // must belong to MSysObjects
+                        catPages++;
+
+                        // Row decoding works from the start of a page, so lift this one out of
+                        // the block. There are only a handful of catalog pages.
+                        if (at != 0) Buffer.BlockCopy(page, at, scan, 0, _pgSz);
+                        byte[] catalogPage = at == 0 ? page : scan;
+
+                    foreach (RowSpan span in EnumerateRowSpans(catalogPage, catScanner))
                     {
                         if (!CrackRow(span.Page, span.Start, span.Size, msysShape, catRow, null)) continue;
 
@@ -845,6 +890,7 @@ namespace JetDatabaseReader
 
                         if (tdefPage > 0)
                             result.Add(new CatalogEntry { Name = nameStr, TDefPage = tdefPage });
+                    }
                     }
                 }
 

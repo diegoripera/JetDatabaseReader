@@ -131,9 +131,15 @@ namespace JetDatabaseReader.Benchmarks
 
             try
             {
+                // Opening scans every page to build the catalog and page index, so this is the
+                // cost a service pays before it can read anything at all.
+                var sw = System.Diagnostics.Stopwatch.StartNew();
                 using var reader = Open(db);
                 var tables = reader.ListTables();
+                sw.Stop();
+
                 long after = GC.GetTotalMemory(forceFullCollection: true);
+                Console.WriteLine($"   Open + ListTables: {sw.Elapsed.TotalMilliseconds:F1} ms");
 
                 foreach (string line in reader.LastDiagnostics.Split('\n'))
                     if (line.Trim().Length > 0) Console.WriteLine($"   {line.Trim()}");
