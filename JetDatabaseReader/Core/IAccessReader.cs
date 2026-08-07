@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Data;
+using System.Threading;
 using System.Threading.Tasks;
 
 namespace JetDatabaseReader
@@ -17,7 +18,8 @@ namespace JetDatabaseReader
         /// <summary>Maximum number of pages to keep in cache. 0 = unlimited, -1 = disabled. Default: 256 (1 MB for 4K pages).</summary>
         int PageCacheSize { get; set; }
 
-        /// <summary>When true, uses parallel processing for reading multiple pages. Can improve performance for large tables. Default: false.</summary>
+        /// <summary>Has no effect. Kept so existing code keeps compiling.</summary>
+        [Obsolete("Has no effect — page reads are serialised on the shared file handle.")]
         bool ParallelPageReadsEnabled { get; set; }
 
         /// <summary>Diagnostic output populated after each call to <see cref="ListTables"/>.</summary>
@@ -147,6 +149,28 @@ namespace JetDatabaseReader
         /// <c>SqlBulkCopy</c>, <c>DataTable.Load</c>, or a streaming exporter.
         /// </summary>
         AccessDataReader CreateDataReader(string tableName, IReadOnlyList<string> columns = null);
+
+        /// <summary>Counts live rows, stopping when the token is signalled.</summary>
+        long GetRealRowCount(string tableName, CancellationToken cancellationToken);
+
+        /// <summary>Streams typed rows, stopping when the token is signalled.</summary>
+        IEnumerable<object[]> StreamRows(string tableName, IReadOnlyList<string> columns,
+                                         IProgress<int> progress, CancellationToken cancellationToken);
+
+        /// <summary>Streams string rows, stopping when the token is signalled.</summary>
+        IEnumerable<string[]> StreamRowsAsStrings(string tableName, IReadOnlyList<string> columns,
+                                                  IProgress<int> progress, CancellationToken cancellationToken);
+
+        /// <summary>Reads a table into a typed DataTable asynchronously, honouring cancellation.</summary>
+        Task<DataTable> ReadTableAsync(string tableName, IReadOnlyList<string> columns,
+                                       IProgress<int> progress, CancellationToken cancellationToken);
+
+        /// <summary>Reads a table into a string DataTable asynchronously, honouring cancellation.</summary>
+        Task<DataTable> ReadTableAsStringDataTableAsync(string tableName, IReadOnlyList<string> columns,
+                                                        IProgress<int> progress, CancellationToken cancellationToken);
+
+        /// <summary>Counts live rows asynchronously, honouring cancellation.</summary>
+        Task<long> GetRealRowCountAsync(string tableName, CancellationToken cancellationToken);
 
         /// <summary>
         /// Returns statistical information about the database.

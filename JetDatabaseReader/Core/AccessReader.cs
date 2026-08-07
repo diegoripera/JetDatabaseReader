@@ -55,9 +55,6 @@ namespace JetDatabaseReader
         private const byte T_GUID    = 0x0F; // 16 bytes
         private const byte T_NUMERIC = 0x10; // 17 bytes scaled decimal
 
-        // Column flag bits
-        private const byte FLAG_FIXED = 0x01;
-
         // Catalog (MSysObjects) constants
         private const int  OBJ_TABLE        = 1;  // local table
         private const int  OBJ_LINKED_ODBC  = 4;  // linked through an ODBC driver
@@ -136,7 +133,11 @@ namespace JetDatabaseReader
         /// <summary>Maximum number of pages to keep in cache. 0 = unlimited, -1 = disabled. Default: 256 (1 MB for 4K pages).</summary>
         public int PageCacheSize { get; set; } = 256;
 
-        /// <summary>When true, uses parallel processing for reading multiple pages. Can improve performance for large tables. Default: false.</summary>
+        /// <summary>
+        /// Has no effect. Nothing reads this; page reads are serialised on the shared file handle.
+        /// Kept so existing code keeps compiling.
+        /// </summary>
+        [Obsolete("Has no effect — page reads are serialised on the shared file handle.")]
         public bool ParallelPageReadsEnabled { get; set; }
 
         /// <summary>
@@ -162,7 +163,9 @@ namespace JetDatabaseReader
 
             DiagnosticsEnabled = options.DiagnosticsEnabled;
             PageCacheSize = options.PageCacheSize;
+#pragma warning disable CS0618 // carrying an obsolete option through is deliberate
             ParallelPageReadsEnabled = options.ParallelPageReadsEnabled;
+#pragma warning restore CS0618
             OleObjectMode = options.OleObjectMode;
 
             // Two deliberate choices here:
@@ -389,6 +392,7 @@ namespace JetDatabaseReader
             try
             {
                 _fs?.Dispose();
+                _crypto?.Dispose();
                 lock (_cacheLock)
                 {
                     _pageCache?.Clear();
@@ -496,14 +500,16 @@ namespace JetDatabaseReader
                     if (got == 0) break;
                     read += got;
                 }
+
+                // A freshly allocated array was zero-filled; a reused one is not. Clear the tail
+                // so a short read at end-of-file cannot expose the previous page's bytes.
+                if (read < _pgSz) Array.Clear(buf, read, _pgSz - read);
+
+                // Decryption reuses its cipher and buffers, so it runs under the same lock rather
+                // than paying for per-page state. Page 0 carries the header and the encryption
+                // descriptor and is never encrypted.
+                if (_crypto != null && n > 0) _crypto.DecryptPage(buf, _pgSz, n);
             }
-
-            // A freshly allocated array was zero-filled; a reused one is not. Clear the tail so a
-            // short read at end-of-file cannot expose the previous page's bytes.
-            if (read < _pgSz) Array.Clear(buf, read, _pgSz - read);
-
-            // Page 0 carries the header and the encryption descriptor and is never encrypted.
-            if (_crypto != null && n > 0) _crypto.DecryptPage(buf, _pgSz, n);
         }
 
         /// <summary>
@@ -1188,7 +1194,14 @@ namespace JetDatabaseReader
         /// This is slower than reading the TDEF RowCount (which may be stale), but always accurate.
         /// Use this after many deletes/imports when Compact &amp; Repair hasn't been run.
         /// </summary>
-        public long GetRealRowCount(string tableName)
+        public long GetRealRowCount(string tableName) => GetRealRowCount(tableName, default);
+
+        /// <summary>
+        /// Counts live rows, stopping when <paramref name="cancellationToken"/> is signalled.
+        /// A full count walks every page the table owns, which on a large database is long enough
+        /// to outlive the request that asked for it.
+        /// </summary>
+        public long GetRealRowCount(string tableName, CancellationToken cancellationToken)
         {
             ThrowIfDisposed();
             Guard.NotNullOrEmpty(tableName, nameof(tableName));
@@ -1204,6 +1217,8 @@ namespace JetDatabaseReader
 
             foreach (long p in EnumerateTablePages(entry.TDefPage))
             {
+                cancellationToken.ThrowIfCancellationRequested();
+
                 byte[] page = ReadPageForScan(p, scan);
                 if (page[0] != 0x01) continue;
                 if ((long)Ri32(page, _dpTDefOff) != entry.TDefPage) continue;
@@ -1426,7 +1441,8 @@ namespace JetDatabaseReader
             => StreamRowsCore(tableName, columns, null, copyRows: false);
 
         private IEnumerable<object[]> StreamRowsCore(string tableName, IReadOnlyList<string> columns,
-                                                     IProgress<int> progress, bool copyRows = true)
+                                                     IProgress<int> progress, bool copyRows = true,
+                                                     CancellationToken cancellationToken = default)
         {
             CatalogEntry entry = GetCatalogEntry(tableName);
             if (entry == null) yield break;
@@ -1442,6 +1458,8 @@ namespace JetDatabaseReader
             int rowCount = 0;
             foreach (long p in EnumerateTablePages(entry.TDefPage))
             {
+                cancellationToken.ThrowIfCancellationRequested();
+
                 byte[] page = ReadPageForScan(p, scan);
                 if (page[0] != 0x01) continue;
                 if ((long)Ri32(page, _dpTDefOff) != entry.TDefPage) continue;
@@ -1489,7 +1507,8 @@ namespace JetDatabaseReader
         }
 
         private IEnumerable<string[]> StreamRowsAsStringsCore(string tableName, IReadOnlyList<string> columns,
-                                                              IProgress<int> progress)
+                                                              IProgress<int> progress,
+                                                              CancellationToken cancellationToken = default)
         {
             CatalogEntry entry = GetCatalogEntry(tableName);
             if (entry == null) yield break;
@@ -1505,6 +1524,8 @@ namespace JetDatabaseReader
             int rowCount = 0;
             foreach (long p in EnumerateTablePages(entry.TDefPage))
             {
+                cancellationToken.ThrowIfCancellationRequested();
+
                 byte[] page = ReadPageForScan(p, scan);
                 if (page[0] != 0x01) continue;
                 if ((long)Ri32(page, _dpTDefOff) != entry.TDefPage) continue;
@@ -1529,7 +1550,7 @@ namespace JetDatabaseReader
         /// <param name="tableName">Table name (case-insensitive). If null or empty, reads the first table.</param>
         /// <param name="progress">Optional progress reporter — receives row count after each page.</param>
         public DataTable ReadTableAsStringDataTable(string tableName = null, IProgress<int> progress = null)
-            => ReadTableAsStringDataTableCore(tableName, null, progress);
+            => ReadTableAsStringDataTableCore(tableName, null, progress, default);
 
         /// <summary>
         /// Reads only <paramref name="columns"/> into a DataTable of string columns.
@@ -1541,10 +1562,10 @@ namespace JetDatabaseReader
         /// <exception cref="ArgumentException">A requested column does not exist in the table.</exception>
         public DataTable ReadTableAsStringDataTable(string tableName, IReadOnlyList<string> columns,
                                                     IProgress<int> progress)
-            => ReadTableAsStringDataTableCore(tableName, columns, progress);
+            => ReadTableAsStringDataTableCore(tableName, columns, progress, default);
 
         private DataTable ReadTableAsStringDataTableCore(string tableName, IReadOnlyList<string> columns,
-                                                         IProgress<int> progress)
+                                                         IProgress<int> progress, CancellationToken cancellationToken)
         {
             ThrowIfDisposed();
             // If no table name specified, use the first table
@@ -1782,7 +1803,7 @@ namespace JetDatabaseReader
         /// <param name="tableName">Table name (case-insensitive). If null or empty, reads the first table.</param>
         /// <param name="progress">Optional progress reporter — receives row count after each page.</param>
         public DataTable ReadTable(string tableName = null, IProgress<int> progress = null)
-            => ReadTableCore(tableName, null, progress);
+            => ReadTableCore(tableName, null, progress, default);
 
         /// <summary>
         /// Reads only <paramref name="columns"/> into a DataTable with native CLR column types.
@@ -1794,9 +1815,10 @@ namespace JetDatabaseReader
         /// <param name="progress">Optional progress reporter — receives row count after each page.</param>
         /// <exception cref="ArgumentException">A requested column does not exist in the table.</exception>
         public DataTable ReadTable(string tableName, IReadOnlyList<string> columns, IProgress<int> progress)
-            => ReadTableCore(tableName, columns, progress);
+            => ReadTableCore(tableName, columns, progress, default);
 
-        private DataTable ReadTableCore(string tableName, IReadOnlyList<string> columns, IProgress<int> progress)
+        private DataTable ReadTableCore(string tableName, IReadOnlyList<string> columns, IProgress<int> progress,
+                                        CancellationToken cancellationToken)
         {
             ThrowIfDisposed();
 
@@ -1853,6 +1875,65 @@ namespace JetDatabaseReader
         }
 
         // ── Async Methods ──────────────────────────────────────────────────
+
+        // ── Cancellable overloads ─────────────────────────────────────────
+        //
+        // These run the synchronous reader on a pool thread — the work is CPU and file I/O, and
+        // the pages are already served largely from the OS cache, so there is no true async I/O
+        // to be had. What the token buys is the ability to abandon a scan: a full read of a large
+        // database easily outlives the request that started it, and without this it would run to
+        // completion holding a thread regardless.
+
+        /// <summary>
+        /// Streams typed rows, stopping when <paramref name="cancellationToken"/> is signalled.
+        /// The token is checked once per page.
+        /// </summary>
+        public IEnumerable<object[]> StreamRows(string tableName, IReadOnlyList<string> columns,
+                                                IProgress<int> progress, CancellationToken cancellationToken)
+        {
+            ThrowIfDisposed();
+            Guard.NotNullOrEmpty(tableName, nameof(tableName));
+            return StreamRowsCore(tableName, columns, progress, true, cancellationToken);
+        }
+
+        /// <summary>
+        /// Streams string rows, stopping when <paramref name="cancellationToken"/> is signalled.
+        /// </summary>
+        public IEnumerable<string[]> StreamRowsAsStrings(string tableName, IReadOnlyList<string> columns,
+                                                         IProgress<int> progress, CancellationToken cancellationToken)
+        {
+            ThrowIfDisposed();
+            Guard.NotNullOrEmpty(tableName, nameof(tableName));
+            return StreamRowsAsStringsCore(tableName, columns, progress, cancellationToken);
+        }
+
+        /// <summary>
+        /// Reads a table into a typed DataTable asynchronously, honouring cancellation.
+        /// </summary>
+        public Task<DataTable> ReadTableAsync(string tableName, IReadOnlyList<string> columns,
+                                              IProgress<int> progress, CancellationToken cancellationToken)
+        {
+            ThrowIfDisposed();
+            return Task.Run(() => ReadTableCore(tableName, columns, progress, cancellationToken), cancellationToken);
+        }
+
+        /// <summary>
+        /// Reads a table into a string DataTable asynchronously, honouring cancellation.
+        /// </summary>
+        public Task<DataTable> ReadTableAsStringDataTableAsync(string tableName, IReadOnlyList<string> columns,
+                                                               IProgress<int> progress, CancellationToken cancellationToken)
+        {
+            ThrowIfDisposed();
+            return Task.Run(() => ReadTableAsStringDataTableCore(tableName, columns, progress, cancellationToken),
+                            cancellationToken);
+        }
+
+        /// <summary>Counts live rows asynchronously, honouring cancellation.</summary>
+        public Task<long> GetRealRowCountAsync(string tableName, CancellationToken cancellationToken)
+        {
+            ThrowIfDisposed();
+            return Task.Run(() => GetRealRowCount(tableName, cancellationToken), cancellationToken);
+        }
 
         /// <summary>Returns the names of all user tables in the database asynchronously.</summary>
         public Task<List<string>> ListTablesAsync()
@@ -2617,11 +2698,18 @@ namespace JetDatabaseReader
                     int fileLen = start + len - i;
                     return "data:image/gif;base64," + Convert.ToBase64String(b, i, fileLen);
                 }
-                // BMP: 42 4D
-                if (b[i] == 0x42 && b[i+1] == 0x4D)
+                // BMP: 42 4D. Two bytes is far too weak on its own — "BM" occurs constantly in
+                // ordinary binary data — so also require the header to be self-consistent: the
+                // reserved fields must be zero and the declared size must match what is left.
+                if (b[i] == 0x42 && b[i+1] == 0x4D && i + 14 <= start + len)
                 {
-                    int fileLen = start + len - i;
-                    return "data:image/bmp;base64," + Convert.ToBase64String(b, i, fileLen);
+                    int declared = Ri32(b, i + 2);
+                    int reserved = Ri32(b, i + 6);
+                    int pixelOffset = Ri32(b, i + 10);
+                    int remaining = start + len - i;
+
+                    if (reserved == 0 && declared == remaining && pixelOffset > 0 && pixelOffset < remaining)
+                        return "data:image/bmp;base64," + Convert.ToBase64String(b, i, remaining);
                 }
 
                 // ── Documents ──

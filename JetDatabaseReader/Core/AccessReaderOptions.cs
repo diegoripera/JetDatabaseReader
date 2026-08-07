@@ -1,3 +1,4 @@
+using System;
 using System.IO;
 
 namespace JetDatabaseReader
@@ -13,7 +14,11 @@ namespace JetDatabaseReader
         /// <summary>When true, logs verbose diagnostic information. Default: false.</summary>
         public bool DiagnosticsEnabled { get; set; }
 
-        /// <summary>When true, uses parallel processing for reading multiple pages. Can improve performance for large tables. Default: false.</summary>
+        /// <summary>
+        /// Has no effect. Nothing reads this; page reads are serialised on the shared file handle.
+        /// Kept so existing code keeps compiling.
+        /// </summary>
+        [Obsolete("Has no effect — page reads are serialised on the shared file handle.")]
         public bool ParallelPageReadsEnabled { get; set; }
 
         /// <summary>

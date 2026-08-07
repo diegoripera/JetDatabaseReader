@@ -22,6 +22,11 @@ namespace JetDatabaseReader.Benchmarks
     internal static class Program
     {
         private static int _iterations = 5;
+        private static string? _password;
+
+        /// <summary>Opens a benchmark database, passing the password when one was supplied.</summary>
+        private static AccessReader Open(string db) =>
+            AccessReader.Open(db, _password == null ? null : new AccessReaderOptions { Password = _password });
 
         private static int Main(string[] args)
         {
@@ -38,6 +43,7 @@ namespace JetDatabaseReader.Benchmarks
                     case "--db":         explicitDbs.Add(args[++i]); break;
                     case "--huge":       huge = true; break;
                     case "--diag":       diag = true; break;
+                    case "--password":   _password = args[++i]; break;
                     case "--iterations": _iterations = int.Parse(args[++i]); break;
                     default:
                         Console.Error.WriteLine($"Unknown argument: {args[i]}");
@@ -125,7 +131,7 @@ namespace JetDatabaseReader.Benchmarks
 
             try
             {
-                using var reader = AccessReader.Open(db);
+                using var reader = Open(db);
                 var tables = reader.ListTables();
                 long after = GC.GetTotalMemory(forceFullCollection: true);
 
@@ -190,7 +196,7 @@ namespace JetDatabaseReader.Benchmarks
             int tableCount;
             try
             {
-                using var probe = AccessReader.Open(db);
+                using var probe = Open(db);
                 var stats = probe.GetTableStats()
                                  .Where(s => s.ColumnCount > 0)
                                  .OrderBy(s => s.RowCount)
@@ -217,7 +223,7 @@ namespace JetDatabaseReader.Benchmarks
             //    scenario is the regression guard: it must NOT get slower.
             results.Add(Harness.Run(db, "Open + ListTables", _iterations, r =>
             {
-                using var reader = AccessReader.Open(db);
+                using var reader = Open(db);
                 var tables = reader.ListTables();
                 r.Note = $"{tables.Count} tables";
                 r.Retained = tables;
@@ -227,7 +233,7 @@ namespace JetDatabaseReader.Benchmarks
             //     This is the per-open-database resident footprint an Azure App Service carries.
             results.Add(Harness.Run(db, "Idle reader footprint", 1, r =>
             {
-                var reader = AccessReader.Open(db);
+                var reader = Open(db);
                 var tables = reader.ListTables();
                 r.Note = $"{tables.Count} tables, reader held";
                 r.Retained = reader;
@@ -237,7 +243,7 @@ namespace JetDatabaseReader.Benchmarks
             //    Before the fix this costs two whole-file scans (catalog + table).
             results.Add(Harness.Run(db, "Open + ReadTable(small)", _iterations, r =>
             {
-                using var reader = AccessReader.Open(db);
+                using var reader = Open(db);
                 var dt = reader.ReadTable(smallTable);
                 r.Note = $"{dt?.Rows.Count ?? 0} rows";
                 r.Retained = dt;
@@ -246,7 +252,7 @@ namespace JetDatabaseReader.Benchmarks
             // 3. Same read on an already-warm reader (catalog cached). This isolates the
             //    per-table scan cost — the purest measure of the page-index fix.
             {
-                using var reader = AccessReader.Open(db);
+                using var reader = Open(db);
                 reader.ListTables(); // force the catalog scan out of the measurement
                 results.Add(Harness.Run(db, "ReadTable(small) warm", _iterations, r =>
                 {
@@ -259,7 +265,7 @@ namespace JetDatabaseReader.Benchmarks
             // 4. Streaming the largest table on a warm reader. Retains nothing by design —
             //    the contrast against ReadTable is the whole low-memory argument.
             {
-                using var reader = AccessReader.Open(db);
+                using var reader = Open(db);
                 reader.ListTables();
                 results.Add(Harness.Run(db, "StreamRows(big) warm", _iterations, r =>
                 {
@@ -271,7 +277,7 @@ namespace JetDatabaseReader.Benchmarks
 
             // 5. Row counting — pure page scan, no row decoding.
             {
-                using var reader = AccessReader.Open(db);
+                using var reader = Open(db);
                 reader.ListTables();
                 results.Add(Harness.Run(db, "GetRealRowCount(big) warm", _iterations, r =>
                 {
@@ -283,7 +289,7 @@ namespace JetDatabaseReader.Benchmarks
             int allTablesIters = Math.Max(1, _iterations / 2);
             results.Add(Harness.Run(db, "ReadAllTables", allTablesIters, r =>
             {
-                using var reader = AccessReader.Open(db);
+                using var reader = Open(db);
                 var all = reader.ReadAllTables();
                 r.Note = $"{all.Count} tables, {all.Values.Sum(t => t?.Rows.Count ?? 0)} rows";
                 r.Retained = all;

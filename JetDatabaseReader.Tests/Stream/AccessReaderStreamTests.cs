@@ -174,7 +174,7 @@ namespace JetDatabaseReader.Tests
         // ── Matrix (local-only large file) — smoke test ───────────────────
 
         [Fact]
-        public void StreamRows_Matrix_DoesNotExceedReasonableMemory()
+        public void StreamRows_Matrix_DoesNotRetainRowsItHasYielded()
         {
             string path = TestDatabases.LargeFile;
             if (!TestDatabases.IsReadable(path)) return; // skip if not present or encrypted
@@ -183,28 +183,31 @@ namespace JetDatabaseReader.Tests
             string table = reader.GetTableStats().FirstOrDefault(s => s.RowCount > 0).Name
                            ?? reader.ListTables()[0];
 
-            // GC.GetTotalMemory is process-wide and xUnit runs test classes in parallel, so a
-            // before/after delta around the whole enumeration also counts whatever other tests
-            // are holding — several of them read this same 2 GB file. Measure the GROWTH between
-            // two points inside one enumeration instead: concurrent noise affects both readings,
-            // and "90 000 more rows costs no more memory" is the invariant this test is about.
+            // Earlier versions of this test compared GC.GetTotalMemory before and after. That
+            // counter is process-wide and xUnit runs test classes in parallel, so it kept picking
+            // up memory held by other tests — including several that read this same 2 GB file —
+            // and failed intermittently no matter how the deltas were arranged.
+            //
+            // Assert the actual invariant instead, which is deterministic and immune to whatever
+            // else is running: once the enumerator has moved past a row, nothing holds it.
+            WeakReference firstRow = null;
             int count = 0;
-            long at10k = 0;
 
-            foreach (object[] _ in reader.StreamRows(table))
+            foreach (object[] row in reader.StreamRows(table))
             {
+                if (count == 0) firstRow = new WeakReference(row);
                 count++;
-                if (count == 10_000) at10k = GC.GetTotalMemory(forceFullCollection: true);
-                if (count >= 100_000) break;
+                if (count >= 50_000) break;
             }
 
-            if (count < 20_000) return; // table too small for the comparison to mean anything
+            if (count < 1_000) return; // too few rows for this to mean anything
 
-            long at100k  = GC.GetTotalMemory(forceFullCollection: true);
-            long growthMb = (at100k - at10k) / (1024 * 1024);
+            GC.Collect();
+            GC.WaitForPendingFinalizers();
+            GC.Collect();
 
-            growthMb.Should().BeLessThan(100,
-                because: "streaming must not accumulate rows — 10x more rows should not cost 10x memory");
+            firstRow!.IsAlive.Should().BeFalse(
+                because: "a streamed row must be collectable once enumeration has moved past it");
         }
 
         [Fact]

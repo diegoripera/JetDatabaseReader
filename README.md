@@ -202,6 +202,24 @@ IEnumerable<string[]> recent = reader.Query("Orders")
 
 ## Async Operations
 
+These run the synchronous reader on a pool thread — the work is CPU and file I/O — so what the
+`CancellationToken` overloads buy is the ability to *abandon* a scan. A full read of a large
+database easily outlives the request that started it:
+
+```csharp
+DataTable dt = await reader.ReadTableAsync("Orders", columns: null,
+                                           progress: null, cancellationToken: ct);
+
+long rows = await reader.GetRealRowCountAsync("Orders", ct);
+
+foreach (object[] row in reader.StreamRows("Orders", columns: null, progress: null, ct))
+{
+    // throws OperationCanceledException at the next page boundary once ct is signalled
+}
+```
+
+The token is checked once per page, which is the natural granularity for stopping.
+
 ```csharp
 List<string>                  tables = await reader.ListTablesAsync();
 DataTable                     dt     = await reader.ReadTableAsync("Orders");
@@ -386,6 +404,10 @@ directly sees the same data. Treat such a file as unprotected at rest.
 **ACE encryption** (Access 2010+, `.accdb`, "Encrypt with Password") is the real thing: ECMA-376
 agile encryption with AES, and the pages are decrypted as they are read. `reader.IsEncrypted` tells
 the two cases apart.
+
+> Opening an encrypted database runs the key derivation the format mandates — 100 000 hash
+> iterations — which takes tens of milliseconds and allocates transiently. That is per `Open`, not
+> per read, so cache the reader rather than opening one per request.
 
 Access truncates a database password to 20 characters when it is set, so a longer password is
 compared and derived on the same terms — you can pass either form.

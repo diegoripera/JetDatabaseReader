@@ -177,6 +177,44 @@ of the seventeenth character. It behaved like a flag only because an unset passw
 mask's own value there, and would have misreported for passwords whose seventeenth character
 cleared those bits.
 
+### ⚡ Decryption cost, and a self-inflicted regression
+
+The first working decryption built a hash object, a cipher, and a page-sized array **per page**.
+Measured against the same database unencrypted, that cost 17× on time and 42× on allocations —
+50 MB to scan a 12 MB file. The cipher, hash, and scratch buffer are now created once and reused,
+and decryption runs under the lock that already serialises file reads, so no extra synchronisation
+is needed. Allocations for a full scan dropped from 50 MB to 19 MB.
+
+Hand-rolling CBC over a reused ECB transform was tried and rejected on measurement: it removes the
+per-page transform object but the XOR pass in managed code is four times slower than letting the
+platform do the chaining (61 ms vs 15 ms per 3 000 pages; a 64-bit unsafe XOR still lost at 15 ms
+vs 6.5 ms). The platform does it in native code, and that wins.
+
+What remains is the key derivation itself: 100 000 hash iterations, which the format mandates and
+which is the point of a KDF. It runs once per `Open`, is transient Gen0 garbage, and retains
+nothing — so the guidance is to cache the reader rather than open one per request. Deriving with
+an over-long password no longer costs two derivations: since Access stored the truncation, that
+form is tried first.
+
+### ✨ Cancellation
+
+`GetRealRowCount`, `StreamRows`, `StreamRowsAsStrings`, `ReadTableAsync`,
+`ReadTableAsStringDataTableAsync`, and the new `GetRealRowCountAsync` accept a `CancellationToken`,
+checked once per page. The async methods still run the synchronous reader on a pool thread — the
+work is CPU and file I/O, and pages come largely from the OS cache, so there is no true async I/O
+to be had. What the token buys is abandoning a scan that has outlived the request that asked for it.
+
+### 🐛 OLE detection: BMP false positives
+
+BMP was detected from the two bytes `42 4D` scanned over a 512-byte window, so any blob containing
+"BM" was reported as an image. It now also requires the header to be self-consistent — reserved
+field zero, declared size matching what remains, plausible pixel offset.
+
+### 🧹 `ParallelPageReadsEnabled` marked obsolete
+
+It never had an effect; nothing reads it. Marked `[Obsolete]` rather than removed so existing code
+keeps compiling, and the unused `FLAG_FIXED` constant is gone.
+
 ### ✨ ACE encryption (`.accdb`) — supported
 
 Encrypted databases now open with `AccessReaderOptions.Password`, and `AccessReader.IsEncrypted`
@@ -289,11 +327,14 @@ dotnet run -c Release -- --diag --huge     # per-database index and resident foo
 - **Flaky progress test** — `ReadTable_WithProgress_ReportsIncreasingRowCounts` collected
   `Progress<int>` callbacks into a `List<int>` and enumerated it while thread-pool callbacks could
   still be adding to it. Now uses a `ConcurrentQueue<int>` and asserts over a snapshot.
-- **Flaky memory test** — `StreamRows_Matrix_DoesNotExceedReasonableMemory` compared
-  `GC.GetTotalMemory` before and after a whole enumeration. That counter is process-wide and xUnit
-  runs test classes in parallel, so the delta also counted memory held by other tests reading the
-  same 2 GB file. It now measures heap *growth* between two points inside one enumeration, which
-  is the invariant it was written to check and is unaffected by concurrent tests.
+- **Flaky memory test, properly fixed** — `StreamRows_Matrix_DoesNotExceedReasonableMemory`
+  compared `GC.GetTotalMemory` before and after an enumeration. That counter is process-wide and
+  xUnit runs test classes in parallel, so it kept measuring memory held by other tests reading the
+  same 2 GB file. Rearranging the deltas reduced the flakiness but did not remove it — the
+  encryption tests, which allocate ~17 MB each deriving a key, were enough to shift the reading
+  again. It now asserts the invariant directly and deterministically: a `WeakReference` to an
+  early row must be dead after enumeration has moved past it, proving nothing retains yielded
+  rows. Renamed to `StreamRows_Matrix_DoesNotRetainRowsItHasYielded`.
 
 ---
 
