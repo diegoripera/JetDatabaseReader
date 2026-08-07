@@ -376,6 +376,19 @@ catch (ObjectDisposedException) { /* reader already disposed */ }
 | ⚠️ Jet3 (Access 97) | Implemented, but untested against a real file — see below |
 | ❌ Write operations | Read-only library |
 
+### Two places the reader differs from Access
+
+Everything else is verified against the Access engine itself — row counts and cell values for 78
+tables across 16 databases. Two differences remain, both deliberate:
+
+**Zero-length text reads as null.** Access distinguishes a stored zero-length string from Null;
+this library returns `DBNull.Value` for both. If that distinction matters to you, it is not
+recoverable from what this returns.
+
+**A memo whose first character is U+FEFF loses it.** JET introduces compressed text with the bytes
+`FF FE`, which is also how a leading byte-order mark encodes in plain UCS-2, and nothing in the
+column descriptor separates the two cases. Every JET reader has this ambiguity.
+
 ### Complex columns
 
 Access 2007 added three column kinds that do not store their values in the row: **Attachment**,

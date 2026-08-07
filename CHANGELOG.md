@@ -28,6 +28,62 @@ repeatedly; on a 228 000-row read that cost **16% of allocations and 18% of peak
 count drifts after deletes, so it is treated strictly as a hint and ignored when implausible for
 the file's size.
 
+### 🐛 Five ways the reader disagreed with Access
+
+Every check up to this point compared the library's two read paths against each other. That cannot
+catch a row the library never sees or a field it decodes consistently wrongly — both paths fail
+identically. Comparing against the **Access engine itself** (ACE OLEDB) over 78 tables in 16
+databases found five real defects, all of which predate this branch.
+
+**Rows vanished from tables with no variable-length columns.** JET writes no `var_len` field when
+every column is fixed, and the reader read one anyway — landing on the tail of the last fixed
+column. Nwind's `Order Details` ends in a `Discount` float: rows with a discount of zero parsed,
+and **838 of 2 155 rows — 39% of the table — were dropped in silence**. The reader's own
+`GetRealRowCount` said 2 155 while `StreamRows` yielded 1 317, which is how visible this was all
+along.
+
+**Every `Decimal` column returned nonsense.** The 17-byte NUMERIC field is a sign byte followed by
+a 128-bit magnitude in four little-endian words stored most-significant-first, and the scale lives
+in the column descriptor, not the row. The old reading took the scale from byte 1 and the
+magnitude from bytes 4..15, which is the layout of nothing: Chinook's `Track.UnitPrice` — 0.99 in
+all 3 503 rows — came back as `467514281804094876155904`.
+
+**Every `GUID` column in AdventureWorksLT was fabricated.** Whether a column sits in the fixed or
+the variable area is decided by the descriptor's FIXED bit and nothing else; the reader decided by
+*type*, on the reasoning that a GUID is 16 bytes so it must be fixed. Access stores those
+`rowguid` columns variably, so the reader read 16 bytes from the unused `offset_F` — zero, the
+first column — and returned GUIDs built out of each row's primary key: `ProductModelID` 1 became
+`00000001-0000-0000-a071-e2400e000080`.
+
+**Text went to mojibake after the first accent.** JET's compressed encoding toggles between 1-byte
+and 2-byte modes on a single NUL, in both directions; leaving 2-byte mode was coded as needing a
+NUL *pair*. The result was a lost byte of alignment rather than a lost character, so everything
+after the first non-Latin-1 character was garbage — `this “Welcome” panel` became
+`this “圀汥潣敭`. Plain ASCII never leaves compressed mode, which is why most values looked fine.
+
+**Long memos lost characters at every page boundary.** A chunk in an LVAL chain is a 4-byte
+pointer followed by payload; the reader skipped 8, treating the first four bytes of text as a
+length field. Four bytes at the head of each chunk is two characters, so a memo spanning three
+LVAL pages came back missing two characters in three places.
+
+Verified by comparing every value of every table against ACE: **78 tables, 16 databases, row counts
+and cell values now agree**, except for the two documented differences below.
+
+#### Two differences that remain
+
+*Zero-length text reads as null.* Access distinguishes a zero-length string from Null; this library
+maps both to `DBNull.Value`, as it always has. It is visible in real data — `Item Flags` in the
+sample production databases is a zero-length string in all 280 468 rows, and reads as null. This is
+a semantic choice rather than a decoding error, and changing it would change what existing callers
+see, so it is recorded here rather than altered.
+
+*A memo whose first character is U+FEFF loses it.* Compressed text is introduced by the bytes
+FF FE, which is also how a leading byte-order mark encodes in plain UCS-2, and the column
+descriptor carries nothing that tells them apart — compressed and uncompressed columns have
+identical descriptor bytes. mdbtools and jackcess read it the same way. Gating on the descriptor
+flag that looked like it meant "compressed" was tried and turned every compressed memo in a real
+database into mojibake; one lost BOM in six values is the better trade.
+
 ### 🧹 Complex columns now say what they are
 
 Attachment, Multi-Value and append-only Memo history columns share type code **`0x12`** — the docs

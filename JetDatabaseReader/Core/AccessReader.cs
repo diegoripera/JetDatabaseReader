@@ -94,6 +94,8 @@ namespace JetDatabaseReader
         private readonly int _colSzOff;     // col_len
         private readonly int _colFlagsOff;  // bitmask
         private readonly int _colNumOff;    // col_num (includes deleted)
+        private readonly int _colPrecOff;   // col_prec  – T_NUMERIC total digits
+        private readonly int _colScaleOff;  // col_scale – T_NUMERIC digits after the point
 
         // Per-real-index entry size (skipped during column parsing)
         private readonly int _realIdxEntrySz;
@@ -267,6 +269,8 @@ namespace JetDatabaseReader
                 _colSzOff     = 23;   // col_len   (2)
                 _colFlagsOff  = 15;   // bitmask   (1): 1+4+2+2+2+2+2
                 _colNumOff    =  5;   // col_num   (2)
+                _colPrecOff   = 11;   // col_prec  (1)
+                _colScaleOff  = 12;   // col_scale (1)
 
                 _realIdxEntrySz = 12;
                 _numColsFldSz   =  2;
@@ -297,6 +301,8 @@ namespace JetDatabaseReader
                 _colSzOff     = 16;   // col_len   (2)
                 _colFlagsOff  = 13;   // bitmask   (1)
                 _colNumOff    =  1;   // col_num   (2)
+                _colPrecOff   =  9;   // col_prec  (1)
+                _colScaleOff  = 10;   // col_scale (1)
 
                 _realIdxEntrySz =  8;
                 _numColsFldSz   =  1;
@@ -720,7 +726,11 @@ namespace JetDatabaseReader
                     VarIdx   = Ru16(td, o + _colVarOff),
                     FixedOff = Ru16(td, o + _colFixedOff),
                     Size     = Ru16(td, o + _colSzOff),
-                    Flags    = td[o + _colFlagsOff]
+                    Flags    = td[o + _colFlagsOff],
+                    // T_NUMERIC keeps its scale here, not in the row — the 17 stored bytes are a
+                    // sign and a 128-bit magnitude with nothing to say where the point goes.
+                    Precision = td[o + _colPrecOff],
+                    Scale     = td[o + _colScaleOff]
                 });
             }
 
@@ -2350,19 +2360,30 @@ namespace JetDatabaseReader
             //  Jet4: [null_mask][var_len(2)][var_table(varLen*2)][eod(2)]
             //  Jet3: [null_mask][var_len(1)][jump_table(n*1)][var_table(varLen*1)][eod(1)]
 
-            int varLenPos = nullMaskPos - _varLenFldSz;  // relative
-            if (varLenPos < _numColsFldSz) return false;
+            // A table whose columns are all fixed-length has no variable section in its rows:
+            // no var_len, no var_table, no eod. Reading them anyway lands on the tail of the last
+            // fixed column — which is zero often enough to pass, and garbage the rest of the time.
+            // In Nwind's all-fixed "Order Details" that was the Discount float: every row with a
+            // discount of 0 parsed, and all 838 rows with a real discount were dropped without a
+            // word, 39% of the table.
+            int varLen = 0, varTableStart = 0, eod = 0;
 
-            int varLen = _jet4 ? Ru16(page, rowStart + varLenPos) : page[rowStart + varLenPos];
+            if (shape.Table.HasVariableColumns)
+            {
+                int varLenPos = nullMaskPos - _varLenFldSz;  // relative
+                if (varLenPos < _numColsFldSz) return false;
 
-            // Jet3 jump table: floor(rowSize / 256) entries of 1 byte each
-            int jumpSz = _jet4 ? 0 : (rowSize / 256);
+                varLen = _jet4 ? Ru16(page, rowStart + varLenPos) : page[rowStart + varLenPos];
 
-            int varTableStart = varLenPos - jumpSz - varLen * _varEntrySz;  // relative
-            int eodPos        = varTableStart - _eodFldSz;                  // relative
-            if (eodPos < _numColsFldSz) return false;
+                // Jet3 jump table: floor(rowSize / 256) entries of 1 byte each
+                int jumpSz = _jet4 ? 0 : (rowSize / 256);
 
-            int eod = _jet4 ? Ru16(page, rowStart + eodPos) : page[rowStart + eodPos];
+                varTableStart = varLenPos - jumpSz - varLen * _varEntrySz;  // relative
+                int eodPos    = varTableStart - _eodFldSz;                  // relative
+                if (eodPos < _numColsFldSz) return false;
+
+                eod = _jet4 ? Ru16(page, rowStart + eodPos) : page[rowStart + eodPos];
+            }
 
             // ── Decode each selected column ───────────────────────────────
             ColumnInfo[] cols = shape.Columns;
@@ -2491,7 +2512,7 @@ namespace JetDatabaseReader
                     case T_DOUBLE:   return BitConverter.ToDouble(row, start);
                     case T_DATETIME: return OaDateToValue(BitConverter.ToDouble(row, start));
                     case T_MONEY:    return MoneyToDecimal(BitConverter.ToInt64(row, start));
-                    case T_NUMERIC:  return ReadNumericValue(row, start);
+                    case T_NUMERIC:  return ReadNumericValue(row, start, col);
                     case T_GUID:     return ReadGuidValue(row, start);
                     default:         return NullIfEmpty(BitConverter.ToString(row, start, Math.Min(sz, 8)));
                 }
@@ -2522,9 +2543,14 @@ namespace JetDatabaseReader
 
                     case T_MEMO:
                     case T_OLE:
-                        return NullIfEmpty(ReadLongValue(row, start, len, col.Type == T_OLE));
+                        return NullIfEmpty(ReadLongValue(row, start, len, col));
 
                     default:
+                        // A fixed-size type stored in the variable area — JET allows it and Access
+                        // uses it for GUIDs. The bytes are laid out exactly as they would be in
+                        // the fixed area, so the same reader applies; only where they live differs.
+                        int need = FixedSize(col.Type, col.Size);
+                        if (need > 0 && len >= need) return ReadFixedTyped(row, start, col, need);
                         return DBNull.Value;
                 }
             }
@@ -2623,7 +2649,7 @@ namespace JetDatabaseReader
                     case T_MONEY:
                         return MoneyToDecimal(BitConverter.ToInt64(row, start)).ToString("F4", CultureInfo.InvariantCulture);
                     case T_NUMERIC:
-                        return ReadNumeric(row, start);
+                        return ReadNumeric(row, start, col);
                     case T_GUID:
                         return ReadGuid(row, start);
                     default:
@@ -2656,9 +2682,12 @@ namespace JetDatabaseReader
 
                     case T_MEMO:
                     case T_OLE:
-                        return ReadLongValue(row, start, len, col.Type == T_OLE);
+                        return ReadLongValue(row, start, len, col);
 
                     default:
+                        // See ReadVarTyped: a fixed-size type can live in the variable area.
+                        int need = FixedSize(col.Type, col.Size);
+                        if (need > 0 && len >= need) return ReadFixed(row, start, col, need);
                         return string.Empty;
                 }
             }
@@ -2684,6 +2713,9 @@ namespace JetDatabaseReader
         /// Reads <paramref name="maxLen"/> bytes from a single LVAL data page / row.
         /// lval_dp encoding: upper 24 bits = page number, lower 8 bits = row index.
         /// </summary>
+        /// <summary>Bytes of pointer at the head of every chunk in an LVAL chain.</summary>
+        private const int LvalChainHeader = 4;
+
         private byte[] ReadLvalBytes(uint lvalDp, int maxLen)
         {
             try
@@ -2724,7 +2756,7 @@ namespace JetDatabaseReader
         /// <summary>
         /// Reads multi-page LVAL chains (bitmask 0x00). Follows LVAL page links until
         /// the entire memo is reconstructed or maxLen is reached.
-        /// LVAL page format (mdbtools): [next_page(4)][data_length(4)][data...]
+        /// LVAL chunk format: [next_page(4)][data...] — the rest of the row is payload.
         /// </summary>
         private LvalChainResult ReadLvalChain(uint firstLvalDp, int maxLen)
         {
@@ -2771,16 +2803,19 @@ namespace JetDatabaseReader
                     }
 
                     int rowSize = rowEnd - rowStart + 1;
-                    if (rowSize < 8) return LvalChainResult.Failure($"rowSize {rowSize} < 8");
+                    if (rowSize < LvalChainHeader) return LvalChainResult.Failure($"rowSize {rowSize} < {LvalChainHeader}");
 
-                    // LVAL chain format: [next_dp(4)][data_len(4)][data...]
+                    // LVAL chain chunk: [next_dp(4)][data...]. Nothing else — the chunk carries no
+                    // length of its own. The total is already in the memo header that sent us
+                    // here, and the chunk's own length is its row length.
+                    //
+                    // This used to skip eight bytes, taking the first four bytes of payload as a
+                    // length field. That cost four bytes at the head of every chunk, so a memo
+                    // spanning three LVAL pages came back missing two characters in three places.
+                    // The bogus length was harmless only because it was clamped to the row.
                     currentDp = Ru32(page, rowStart);
-                    int dataLen = (int)Ru32(page, rowStart + 4);
-                    int dataStart = rowStart + 8;
-                    // Never write past what the header declared: a corrupt chain could otherwise
-                    // claim more data than it said it had.
-                    int availableData = Math.Min(dataLen, rowSize - 8);
-                    availableData = Math.Min(availableData, maxLen - totalLen);
+                    int dataStart = rowStart + LvalChainHeader;
+                    int availableData = Math.Min(rowSize - LvalChainHeader, maxLen - totalLen);
 
                     if (availableData > 0 && dataStart + availableData <= page.Length)
                     {
@@ -2878,8 +2913,9 @@ namespace JetDatabaseReader
             return null;
         }
 
-        private string ReadLongValue(byte[] row, int start, int len, bool isOle)
+        private string ReadLongValue(byte[] row, int start, int len, ColumnInfo col)
         {
+            bool isOle = col.Type == T_OLE;
             if (len < 12) return isOle ? "(OLE)" : "(memo)";
 
             // Base64-encoding an OLE blob costs the blob itself plus a string 1.33x its size. When
@@ -2938,9 +2974,17 @@ namespace JetDatabaseReader
         // ── Jet4 text decoding ────────────────────────────────────────────
 
         /// <summary>
-        /// Decodes Jet4 text (UCS-2 / UTF-16LE).
-        /// If data starts with the compressed-unicode marker 0xFF 0xFE, the
-        /// JET4 compressed-string algorithm is applied first.
+        /// Decodes JET4 text, which is either compressed or plain UCS-2. Compressed text opens
+        /// with the two bytes FF FE.
+        ///
+        /// Those same two bytes are also how plain UCS-2 encodes a leading U+FEFF byte-order mark,
+        /// and nothing distinguishes the two cases: the column descriptor carries no usable
+        /// "compressed" flag — databases that store compressed text and databases that store an
+        /// uncompressed BOM have identical descriptor bytes — and the payload after FF FE parses
+        /// either way. A value whose first character really is a BOM therefore loses it. mdbtools
+        /// and jackcess read this the same way, and the alternative — gating on the flag that
+        /// looked like it meant compression — turned every compressed memo in a real database into
+        /// mojibake, which is a far worse trade than one lost BOM.
         /// </summary>
         private static string DecodeJet4Text(byte[] b, int start, int len)
         {
@@ -2969,15 +3013,22 @@ namespace JetDatabaseReader
 
             while (i < end)
             {
+                // One NUL toggles the mode, and it does so in both directions. Leaving
+                // uncompressed mode used to require a 0x00 0x00 pair here, which is not what JET
+                // writes — and the cost was not a missing character but a lost byte of alignment.
+                // Every UCS-2 pair after the first non-Latin-1 character was then read one byte
+                // late, so the rest of the value came back as mojibake: "this “Welcome” panel"
+                // turned into "this “圀汥潣敭". Text without accents or smart quotes never leaves
+                // compressed mode, which is why most values looked fine.
+                if (b[i] == 0x00) { compressed = !compressed; i++; continue; }
+
                 if (compressed)
                 {
-                    if (b[i] == 0x00) { compressed = false; i++; continue; }
                     chars[n++] = (char)b[i++];
                 }
                 else
                 {
                     if (i + 1 >= end) break;
-                    if (b[i] == 0x00 && b[i + 1] == 0x00) { compressed = true; i += 2; continue; }
                     chars[n++] = (char)(b[i] | (b[i + 1] << 8));
                     i += 2;
                 }
@@ -3010,32 +3061,50 @@ namespace JetDatabaseReader
         }
 
         /// <summary>
-        /// Reads a Jet NUMERIC (17 bytes):
-        ///   [precision(1)][scale(1)][sign(1)][pad(1)][96-bit LE integer: lo(4)+mid(4)+hi(4)]
-        /// Uses the <see cref="decimal(int,int,int,bool,byte)"/> constructor which accepts any
-        /// 96-bit integer directly — no manual multiply-chain needed.
+        /// Reads a Jet NUMERIC (17 bytes).
+        ///
+        /// Layout, which is not the one this used to assume:
+        ///
+        ///   [sign(1)][w3(4)][w2(4)][w1(4)][w0(4)]
+        ///
+        /// A sign byte — zero for positive — then a 128-bit magnitude as four 32-bit
+        /// little-endian words stored **most significant first**, so the low word sits at the very
+        /// end of the field. The scale is not in the row at all: it comes from the column
+        /// descriptor, because the stored bytes say nothing about where the point goes.
+        ///
+        /// The previous reading took the scale from byte 1 and the magnitude from bytes 4..15,
+        /// which is the layout of nothing. Chinook's <c>Track.UnitPrice</c> — 0.99 in every one of
+        /// its 3 503 rows — came back as 467514281804094876155904: the 0x63 that is 99 sits nine
+        /// bytes away from where it was looked for, and the scale of 2 was never read at all.
         /// </summary>
-        private static string ReadNumeric(byte[] b, int start)
+        private static string ReadNumeric(byte[] b, int start, ColumnInfo col)
         {
-            object v = ReadNumericValue(b, start);
-            return v is decimal d ? d.ToString("G", CultureInfo.InvariantCulture) : string.Empty;
+            object v = ReadNumericValue(b, start, col);
+            return v is decimal d ? d.ToString(CultureInfo.InvariantCulture) : string.Empty;
         }
 
         /// <summary>
         /// Decimal form of <see cref="ReadNumeric"/>. Returns <see cref="DBNull.Value"/> when the
         /// field is truncated, matching the empty string the string path yields for that case.
         /// </summary>
-        private static object ReadNumericValue(byte[] b, int start)
+        private static object ReadNumericValue(byte[] b, int start, ColumnInfo col)
         {
-            if (start + 16 > b.Length) return DBNull.Value;
+            if (start + 17 > b.Length) return DBNull.Value;
 
-            byte scale = b[start + 1];
-            bool neg   = (b[start + 2] != 0);
-            uint lo    = Ru32(b, start + 4);
-            uint mid   = Ru32(b, start + 8);
-            uint hi    = Ru32(b, start + 12);
+            bool neg   = b[start] != 0;
+            uint w3    = Ru32(b, start + 1);    // most significant
+            uint w2    = Ru32(b, start + 5);
+            uint w1    = Ru32(b, start + 9);
+            uint w0    = Ru32(b, start + 13);   // least significant
+            byte scale = col?.Scale ?? 0;
 
-            // decimal(int lo, int mid, int hi, bool isNegative, byte scale) requires scale ≤ 28
+            // decimal is a 96-bit mantissa with a scale of at most 28. JET's field is 128-bit, so
+            // a value that uses the top word cannot be represented — say so rather than truncate.
+            if (w3 != 0)
+                throw new JetLimitationException(
+                    $"T_NUMERIC value needs more than the 96 bits a .NET decimal holds " +
+                    $"(w3=0x{w3:X8}, w2=0x{w2:X8}, w1=0x{w1:X8}, w0=0x{w0:X8}).");
+
             if (scale > 28)
                 throw new JetLimitationException(
                     $"T_NUMERIC scale {scale} exceeds the .NET decimal maximum of 28.");
@@ -3045,12 +3114,12 @@ namespace JetDatabaseReader
                 // Returns the decimal itself. Formatting belongs to ReadNumeric, which is the
                 // string path; returning text from here made every DECIMAL column read as an
                 // empty string and put a boxed string into a typeof(decimal) DataTable column.
-                return new decimal((int)lo, (int)mid, (int)hi, neg, scale);
+                return new decimal((int)w0, (int)w1, (int)w2, neg, scale);
             }
             catch (OverflowException ex)
             {
                 throw new JetLimitationException(
-                    $"T_NUMERIC value overflow (hi=0x{hi:X8}, mid=0x{mid:X8}, lo=0x{lo:X8}, scale={scale})", ex);
+                    $"T_NUMERIC value overflow (w2=0x{w2:X8}, w1=0x{w1:X8}, w0=0x{w0:X8}, scale={scale})", ex);
             }
         }
 

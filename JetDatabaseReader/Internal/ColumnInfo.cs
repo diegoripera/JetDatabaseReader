@@ -10,37 +10,22 @@ namespace JetDatabaseReader
         public int    FixedOff;  // offset_F: byte offset within the fixed area
         public int    Size;      // col_len (0 for MEMO/OLE/variable)
         public byte   Flags;
+        public byte   Precision; // col_prec:  total digits, T_NUMERIC only
+        public byte   Scale;     // col_scale: digits after the point, T_NUMERIC only
         public string Name = string.Empty;
 
-        // Inherently fixed-length types are always fixed regardless of FLAG_FIXED.
-        // Variable-length types (TEXT, BINARY, MEMO, OLE) are always variable.
-        // For any other type, fall back to the FLAG_FIXED bit in the descriptor.
-        public bool IsFixed
-        {
-            get
-            {
-                switch (Type)
-                {
-                    case 0x01: // T_BOOL
-                    case 0x02: // T_BYTE
-                    case 0x03: // T_INT
-                    case 0x04: // T_LONG
-                    case 0x05: // T_MONEY
-                    case 0x06: // T_FLOAT
-                    case 0x07: // T_DOUBLE
-                    case 0x08: // T_DATETIME
-                    case 0x0F: // T_GUID
-                    case 0x10: // T_NUMERIC
-                        return true;
-                    case 0x0A: // T_TEXT
-                    case 0x09: // T_BINARY
-                    case 0x0C: // T_MEMO
-                    case 0x0B: // T_OLE
-                        return false;
-                    default:
-                        return (Flags & 0x01) != 0; // FLAG_FIXED
-                }
-            }
-        }
+        /// <summary>
+        /// Whether the column's bytes live in the row's fixed area or in its variable area.
+        ///
+        /// The descriptor's FLAG_FIXED bit decides this, and only that bit. A column's *type* does
+        /// not: JET is free to put a fixed-size type in the variable area, and Access does — the
+        /// <c>rowguid</c> columns in AdventureWorksLT are GUIDs stored variably, with the flag
+        /// clear and a var_table index assigned.
+        ///
+        /// Deciding by type instead read those GUIDs from the fixed area, at whatever offset the
+        /// unused offset_F field happened to hold — zero, which is the first column. Every
+        /// <c>rowguid</c> in that database came back built out of the row's primary key.
+        /// </summary>
+        public bool IsFixed => (Flags & 0x01) != 0;   // FLAG_FIXED
     }
 }
