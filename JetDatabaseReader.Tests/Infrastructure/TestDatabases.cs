@@ -37,6 +37,25 @@ namespace JetDatabaseReader.Tests
         public static readonly string LinkedDb =
             Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Test_Autonumber_linked.accdb");
 
+        /// <summary>
+        /// A matched pair of Jet4 databases holding the same three rows, one with a database
+        /// password set and one without. Both are in the repository, unlike the older
+        /// password fixtures — the stored password is masked with the database's creation date,
+        /// so a single passwordless file proves nothing about any other file's date.
+        /// </summary>
+        public static readonly string Jet4NoPassword =
+            Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Jet4_NoPassword.mdb");
+
+        /// <summary>Twin of <see cref="Jet4NoPassword"/> with <see cref="Jet4StoredPassword"/> set.</summary>
+        public static readonly string Jet4WithPassword =
+            Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Jet4_Password.mdb");
+
+        /// <summary>
+        /// Exactly 20 characters — Access's limit for a Jet4 database password, which is also the
+        /// case where the stored field is full and carries no NUL terminator.
+        /// </summary>
+        public const string Jet4StoredPassword = "JetPwd_Test_20Chars!";
+
         // Local-only large file — not added to the project or repository.
         public const string LargeFile = @"D:\Diego\Downloads\DB Matrix.accdb";
 

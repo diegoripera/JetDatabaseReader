@@ -215,6 +215,11 @@ namespace JetDatabaseReader
             // 40-byte password field at 0x42, so it was never a flag: it is the low half of the
             // seventeenth character, and only behaved like one because an unset password leaves
             // the mask's own value there.
+            //
+            // Decoding that field needs the database's creation date as well as the fixed mask —
+            // see JetPassword. Getting that wrong does not merely misreport: it refuses to open
+            // databases that were never protected.
+            //
             // Jet4 only (ver == 1, Access 2000-2003). Jet3 uses a different field, and ACE always
             // encrypts when a password is set, so its 0x42 bytes are not a Jet4 password field at
             // all — decoding them with the Jet4 mask yields noise that reads as "wrong password".

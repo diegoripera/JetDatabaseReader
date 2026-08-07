@@ -16,7 +16,7 @@ Pure-managed .NET library for reading Microsoft Access JET databases — no OleD
 | | |
 |---|---|
 | ✅ **No native dependencies** | Pure C# — runs anywhere .NET runs |
-| ✅ **Jet3 & Jet4 / ACE** | Access 97 through Access 2019 (`.mdb` / `.accdb`) |
+| ✅ **Jet4 / ACE** | Access 2000 through Access 2019 (`.mdb` / `.accdb`); Jet3 implemented but [untested](#jet3) |
 | ✅ **Typed by default** | `int`, `DateTime`, `decimal`, `Guid` — not just strings |
 | ✅ **All column types** | Text, Integer, Currency, Date/Time, GUID, MEMO, OLE Object, Decimal |
 | ✅ **Streaming API** | Process millions of rows without loading the whole file |
@@ -373,7 +373,17 @@ catch (ObjectDisposedException) { /* reader already disposed */ }
 | ✅ ACE encryption (`.accdb`) | Agile encryption (AES) — supply the password the same way |
 | ❌ Attachment fields (0x11) | Rare type added in Access 2007 |
 | ⚠️ Linked tables | Listed with their source; readable only when the source is another Access file |
+| ⚠️ Jet3 (Access 97) | Implemented, but untested against a real file — see below |
 | ❌ Write operations | Read-only library |
+
+### Jet3
+
+The Jet3 page layout is implemented — 2 KB pages and its own TDEF offsets — but every test database
+available is Jet4 or ACE, so **Jet3 has never been exercised against a real file**. It is not a
+format you can produce any more either: Access 2002–2003 already writes Jet4, and the ACE engine
+that ships today refuses to create Jet3 at all ("Could not find installable ISAM"). Treat Jet3
+support as untested rather than as a guarantee, and please open an issue with a sample if you have
+one.
 
 ### Linked tables
 

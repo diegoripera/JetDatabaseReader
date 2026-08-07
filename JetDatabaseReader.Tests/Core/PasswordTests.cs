@@ -33,7 +33,121 @@ namespace JetDatabaseReader.Tests
         // Access truncates a Jet4 database password to 20 characters when it is set.
         private const string StoredPassword = "This_Pwd_IsReally_di";
 
-        // ── Jet4 database password (.mdb) ─────────────────────────────────
+        // ── Jet4 database password, on fixtures that are in the repository ────
+
+        // Everything below this heading used to depend on local-only files, so a clean clone ran
+        // none of it. That is how the bug these tests pin down survived: the stored password is
+        // masked twice, once with a fixed constant and once with a four-byte value derived from
+        // the database's creation date. Only the fixed mask was applied, so the creation-date
+        // residue read as a password on every database created on a different day than the one
+        // the constant had been recovered from — and the reader refused to open files that had
+        // never been protected at all.
+
+        [Fact]
+        public void Jet4_WithoutAPassword_IsNotReportedAsProtected()
+        {
+            if (!File.Exists(TestDatabases.Jet4NoPassword)) return;
+
+            using var reader = AccessReader.Open(TestDatabases.Jet4NoPassword);
+
+            reader.IsPasswordProtected.Should().BeFalse();
+            reader.ListTables().Should().Contain("Sample");
+        }
+
+        [Fact]
+        public void Jet4_WithoutAPassword_OpensWithoutOne()
+        {
+            if (!File.Exists(TestDatabases.Jet4NoPassword)) return;
+
+            // The regression in one line: this threw "This database has a database password".
+            Action act = () => AccessReader.Open(TestDatabases.Jet4NoPassword).Dispose();
+
+            act.Should().NotThrow();
+        }
+
+        [Fact]
+        public void Jet4_TwentyCharacterPassword_RoundTrips()
+        {
+            if (!File.Exists(TestDatabases.Jet4WithPassword)) return;
+
+            // 20 characters fills the 40-byte field exactly, so there is no NUL terminator to
+            // stop at — the decoder has to handle the field running to its end.
+            using var reader = AccessReader.Open(TestDatabases.Jet4WithPassword,
+                new AccessReaderOptions { Password = TestDatabases.Jet4StoredPassword });
+
+            reader.IsPasswordProtected.Should().BeTrue();
+            reader.ListTables().Should().Contain("Sample");
+        }
+
+        [Fact]
+        public void Jet4_ProtectedAndUnprotectedTwins_ReadTheSameRows()
+        {
+            if (!File.Exists(TestDatabases.Jet4WithPassword) || !File.Exists(TestDatabases.Jet4NoPassword)) return;
+
+            using var plain = AccessReader.Open(TestDatabases.Jet4NoPassword);
+            using var locked = AccessReader.Open(TestDatabases.Jet4WithPassword,
+                new AccessReaderOptions { Password = TestDatabases.Jet4StoredPassword });
+
+            List<object[]> a = plain.StreamRows("Sample").ToList();
+            List<object[]> b = locked.StreamRows("Sample").ToList();
+
+            a.Should().HaveCount(3);
+            b.Should().HaveCount(a.Count);
+            for (int r = 0; r < a.Count; r++) b[r].Should().Equal(a[r]);
+        }
+
+        [Theory]
+        [InlineData(null)]
+        [InlineData("")]
+        [InlineData("wrong")]
+        [InlineData("JetPwd_Test_20Chars")]   // one character short
+        [InlineData("jetpwd_test_20chars!")]  // case differs
+        public void Jet4_WithoutTheRightPassword_IsRefused(string? supplied)
+        {
+            if (!File.Exists(TestDatabases.Jet4WithPassword)) return;
+
+            Action act = () => AccessReader.Open(TestDatabases.Jet4WithPassword,
+                new AccessReaderOptions { Password = supplied }).Dispose();
+
+            act.Should().Throw<InvalidOperationException>();
+        }
+
+        [Fact]
+        public void Jet4_LongerPassword_IsComparedOnAccessesTerms()
+        {
+            if (!File.Exists(TestDatabases.Jet4WithPassword)) return;
+
+            // Access truncates to 20 characters when setting a password, so a caller who types
+            // the untruncated password must still get in — that is what Access itself does.
+            using var reader = AccessReader.Open(TestDatabases.Jet4WithPassword,
+                new AccessReaderOptions { Password = TestDatabases.Jet4StoredPassword + "ignored" });
+
+            reader.ListTables().Should().Contain("Sample");
+        }
+
+        [Fact]
+        public void EveryFixtureThatHasNoPassword_OpensWithoutOne()
+        {
+            // A sweep rather than another named case: the failure being guarded against was not
+            // specific to one file, it was one constant being wrong for every file created on a
+            // different day. Any fixture added later is covered for free.
+            string dir = AppDomain.CurrentDomain.BaseDirectory;
+            var refused = new List<string>();
+
+            foreach (string file in Directory.EnumerateFiles(dir)
+                         .Where(f => f.EndsWith(".mdb", StringComparison.OrdinalIgnoreCase)
+                                  || f.EndsWith(".accdb", StringComparison.OrdinalIgnoreCase))
+                         .Where(f => !string.Equals(Path.GetFileName(f), "Jet4_Password.mdb", StringComparison.OrdinalIgnoreCase))
+                         .Where(f => !Path.GetFileName(f).Contains("encrypted", StringComparison.OrdinalIgnoreCase)))
+            {
+                try { using var reader = AccessReader.Open(file); }
+                catch (Exception ex) { refused.Add($"{Path.GetFileName(file)}: {ex.Message}"); }
+            }
+
+            refused.Should().BeEmpty(because: "no unprotected fixture may be refused");
+        }
+
+        // ── Jet4 database password (.mdb), local-only fixtures ────────────
 
         [Fact]
         public void Jet4_WithCorrectPassword_Opens()

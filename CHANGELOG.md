@@ -28,6 +28,31 @@ repeatedly; on a 228 000-row read that cost **16% of allocations and 18% of peak
 count drifts after deletes, so it is treated strictly as a hint and ignored when implausible for
 the file's size.
 
+### 🐛 Unprotected Jet4 databases were refused as password-protected
+
+The stored database password at 0x42 is obfuscated **twice**: once with the fixed header mask, and
+once with a four-byte value derived from the database's creation date, repeated down the field.
+Only the fixed mask was being applied, and that mask had been recovered from a single passwordless
+file — so it silently carried that one file's creation date inside it.
+
+The consequence was not a cosmetic misreport. Every Jet4 `.mdb` created on a **different day** than
+the reference file decoded to that date difference instead of to zeros, which reads as a password,
+and `AccessReader.Open` refused the file with *"This database has a database password"*. Sweeping
+every `.mdb`/`.accdb` on the development machine, **10 of 24 Jet4 files were being refused** —
+databases that had never had a password set. The reference file itself passed, which is exactly why
+the mask looked correct.
+
+The creation date is now read back out of the header and folded into the mask. Verified against
+databases created on purpose with known passwords of 8, 18 and 20 characters — each decodes to
+exactly what was set — and against 46 real databases spanning creation dates from 2011 to 2026, all
+of which now open. Two of those fixtures are **in the repository** now: the password tests before
+this all depended on local-only files, so a clean clone ran none of them, which is how this
+survived.
+
+Where the header does not hold a date this can read, the decoder refuses to guess and reports no
+password rather than inventing one. Locking a caller out of a file that was never locked is the
+worse failure — and a Jet4 password is access control, not encryption, so nothing is exposed by it.
+
 ### 🧹 API completeness
 
 `IAccessReader` was missing `IsPasswordProtected`, `IsEncrypted`, `GetLinkedTables` and
