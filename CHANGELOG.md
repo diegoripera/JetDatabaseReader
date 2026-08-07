@@ -22,6 +22,20 @@ improved; none regressed.
 | Northwind | `GetRealRowCount` | 16.0 ms | ~0 ms | −100% allocated |
 | AdventureWorks | `ReadTable` (warm) | 1.4 ms | 0.2 ms | 8.8×, −92% allocated |
 
+The blob path — LVAL reads, chain assembly, and base64 for OLE — was the last hot route with no
+measurement behind it, because neither large benchmark database contains a populated MEMO or OLE
+cell. Measured on AdventureWorks' `Product` (295 rows, six blob columns including a thumbnail):
+
+| | Time | Allocated |
+|---|------|-----------|
+| All columns | 2.96 ms | 4 274 KB |
+| Blob columns projected away | 0.45 ms | 111 KB |
+| All columns, `OleObjectMode.Placeholder` | 0.80 ms | 257 KB |
+
+So on a table that has them, blobs dominate everything: projecting them away is 6.6× faster and
+uses 38× less memory. That confirms with numbers what the projection and placeholder features were
+added to do, which until now had only been asserted.
+
 Three strategies were tried and **rejected on measurement**, which is worth recording so they are
 not tried again:
 

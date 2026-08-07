@@ -148,7 +148,17 @@ Null values in typed rows surface as `DBNull.Value`.
 ### Column projection — read only what you need
 
 Unselected columns are never decoded. For MEMO and OLE columns that also means their LVAL pages
-are never read, so projecting away blob columns cuts both time and memory:
+are never read, and on a table that has them this dominates everything else. Reading
+AdventureWorks' `Product` — 295 rows, six MEMO/OLE columns including a thumbnail image:
+
+| | Time | Allocated |
+|---|------|-----------|
+| All columns | 2.96 ms | 4 274 KB |
+| Blob columns projected away | **0.45 ms** | **111 KB** |
+| All columns, `OleObjectMode.Placeholder` | 0.80 ms | 257 KB |
+
+If a table has blob columns you do not need, projecting them away is worth more than every other
+optimisation in this library combined.
 
 ```csharp
 foreach (object[] row in reader.StreamRows("BigTable", new[] { "Id", "Total" }, null))
