@@ -22,6 +22,16 @@ improved; none regressed.
 | Northwind | `GetRealRowCount` | 16.0 ms | ~0 ms | −100% allocated |
 | AdventureWorks | `ReadTable` (warm) | 1.4 ms | 0.2 ms | 8.8×, −92% allocated |
 
+`ReadTable` and `ReadTableAsStringDataTable` now pre-size the row collection from the TDEF's row
+count. Without a hint `DataTable` grows by doubling, reallocating and copying the whole collection
+repeatedly; on a 228 000-row read that cost **16% of allocations and 18% of peak heap**. The stored
+count drifts after deletes, so it is treated strictly as a hint and ignored when implausible for
+the file's size.
+
+The page cache was also checked rather than assumed: on a blob-heavy read it serves **81%** of
+LVAL page lookups at the default 256 pages, and raising it to 1024 changes nothing. The default is
+the right size.
+
 The blob path — LVAL reads, chain assembly, and base64 for OLE — was the last hot route with no
 measurement behind it, because neither large benchmark database contains a populated MEMO or OLE
 cell. Measured on AdventureWorks' `Product` (295 rows, six blob columns including a thumbnail):
