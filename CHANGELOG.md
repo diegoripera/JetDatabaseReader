@@ -28,9 +28,24 @@ repeatedly; on a 228 000-row read that cost **16% of allocations and 18% of peak
 count drifts after deletes, so it is treated strictly as a hint and ignored when implausible for
 the file's size.
 
+### 🧹 API completeness and a known cross-runtime difference
+
+`IAccessReader` was missing `IsPasswordProtected`, `IsEncrypted`, `GetLinkedTables` and
+`OpenLinkedTableSource`, so code written against the interface — which the README recommends
+registering for dependency injection — could not tell whether a database was encrypted or discover
+its linked tables. All four are now on the interface.
+
+> **Known gap, not fixed.** `float` and `double` on the *string* path use the `"G"` format, which
+> on .NET Framework yields 15 significant digits and on .NET Core 3.0+ the shortest
+> round-trippable form. The same database therefore renders some floating-point values differently
+> depending on the runtime, and the test suite runs on .NET 8 while the library's main audience is
+> .NET Framework — so the tests do not observe what those callers get. The typed path is
+> unaffected. Fixing it means choosing `"G17"`/`"G9"`, which is deterministic but verbose for
+> ordinary values; it has not been changed because it could not be verified on .NET Framework here.
+
 ### 🐛 Defects found by a review pass over this release
 
-Five, all of which had shipped green against the suite.
+Six, all of which had shipped green against the suite.
 
 - **`ListTables()` returned system tables under 66 cultures.** The catalog decides what is a user
   table by parsing the object type and flags out of text, and did so with the ambient culture.

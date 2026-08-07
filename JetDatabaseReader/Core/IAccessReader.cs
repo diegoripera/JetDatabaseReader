@@ -109,6 +109,28 @@ namespace JetDatabaseReader
         DataTable ReadTableAsStringDataTable(string tableName = null, IProgress<int> progress = null);
 
         /// <summary>
+        /// True when the database carries a Jet4 database password. That password is access
+        /// control rather than encryption — the page data is stored in plain text either way.
+        /// </summary>
+        bool IsPasswordProtected { get; }
+
+        /// <summary>True when the pages are encrypted and are being decrypted as they are read.</summary>
+        bool IsEncrypted { get; }
+
+        /// <summary>
+        /// Returns the tables that are linked rather than stored here, with the connection string
+        /// and the name each has in its source. They are deliberately absent from
+        /// <see cref="ListTables"/> because their rows are not in this file.
+        /// </summary>
+        List<LinkedTable> GetLinkedTables();
+
+        /// <summary>
+        /// Opens the Access database a linked table points at. The returned reader is a separate
+        /// instance and the caller owns it — dispose it when finished.
+        /// </summary>
+        AccessReader OpenLinkedTableSource(LinkedTable link, AccessReaderOptions options = null);
+
+        /// <summary>
         /// Drops the catalog, page index, and page cache so the next call re-reads from disk.
         /// Use when another process may have modified the database under a long-lived reader.
         /// </summary>
