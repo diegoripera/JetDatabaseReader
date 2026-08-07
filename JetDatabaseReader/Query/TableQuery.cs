@@ -121,6 +121,21 @@ namespace JetDatabaseReader
         /// </summary>
         public int Count()
         {
+            // Streaming copies each row out because the caller may keep it. Counting keeps
+            // nothing, so with no predicate to run there is no reason to pay for the copy — on a
+            // 228 000-row table that is roughly 40 MB of arrays allocated only to be discarded.
+            // The rows are still decoded and validated exactly as Execute() would.
+            if (_typedFilter == null)
+            {
+                int rows = 0;
+                foreach (object[] _ in _reader.StreamRowsShared(_tableName, _columns))
+                {
+                    rows++;
+                    if (_limit.HasValue && rows >= _limit.Value) break;
+                }
+                return rows;
+            }
+
             return Execute().Count();
         }
 

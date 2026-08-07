@@ -28,6 +28,11 @@ repeatedly; on a 228 000-row read that cost **16% of allocations and 18% of peak
 count drifts after deletes, so it is treated strictly as a hint and ignored when implausible for
 the file's size.
 
+`Query(t).Count()` no longer copies every row out only to discard it. Streaming copies each row
+because the caller may keep it; counting keeps nothing, so with no predicate to run there is
+nothing to copy for. Rows are still decoded and validated exactly as `Execute()` does — the count
+is identical — and a 228 000-row count dropped from 167 MB to 135 MB allocated.
+
 The page cache was also checked rather than assumed: on a blob-heavy read it serves **81%** of
 LVAL page lookups at the default 256 pages, and raising it to 1024 changes nothing. The default is
 the right size.
