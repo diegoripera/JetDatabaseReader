@@ -132,8 +132,8 @@ namespace JetDatabaseReader.Tests
 
             Dictionary<string, DataTable> all = await reader.ReadAllTablesAsStringsAsync();
 
-            foreach (var (_, dt) in all)
-            foreach (DataColumn col in dt.Columns)
+            foreach (KeyValuePair<string, DataTable> entry in all)
+            foreach (DataColumn col in entry.Value.Columns)
                 col.DataType.Should().Be(typeof(string));
         }
 

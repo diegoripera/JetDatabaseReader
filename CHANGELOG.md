@@ -52,6 +52,17 @@ trade for a display and export surface.
 
 A regression test parses the text back and requires it to equal the typed value exactly.
 
+### ✅ The suite now runs on .NET Framework too
+
+The tests targeted `net8.0` only, while the library's main audience is .NET Framework — so nothing
+verified what those callers actually get. That is not hypothetical: the floating-point data loss
+below only happens on .NET Framework, and the suite could never have caught it.
+
+`JetDatabaseReader.Tests` now multi-targets `net8.0;net48` and **all 492 tests pass on both**,
+including the culture, encryption, concurrency and resource-lifetime cases. Two tests needed
+adjusting to compile — `KeyValuePair` deconstruction arrived with .NET Core 2.0 — and nothing in
+the library itself had to change.
+
 ### ✅ Verified against v2.2.0, value by value
 
 Every value the reader produces was dumped from this build and from a worktree at the v2.2.0

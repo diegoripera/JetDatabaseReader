@@ -177,11 +177,11 @@ namespace JetDatabaseReader.Tests
 
             Dictionary<string, DataTable> all = reader.ReadAllTablesAsStrings();
 
-            foreach (var (tableName, dt) in all)
+            foreach (KeyValuePair<string, DataTable> entry in all)
             {
-                foreach (DataColumn col in dt.Columns)
+                foreach (DataColumn col in entry.Value.Columns)
                     col.DataType.Should().Be(typeof(string),
-                        because: $"ReadAllTablesAsStrings column '{tableName}.{col.ColumnName}' should be string");
+                        because: $"ReadAllTablesAsStrings column '{entry.Key}.{col.ColumnName}' should be string");
             }
         }
 

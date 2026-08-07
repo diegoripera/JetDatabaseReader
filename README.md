@@ -43,9 +43,12 @@ Install-Package JetDatabaseReader
 
 `JetDatabaseReader` targets **`netstandard2.0`**, which is consumed by every current .NET surface:
 
+The test suite runs on both `net8.0` and `net48`, so behaviour is verified on .NET Framework and
+on modern .NET rather than only the latter.
+
 | Consumer | Minimum version |
 |----------|----------------|
-| .NET Framework | 4.6.1 |
+| .NET Framework | 4.6.1 (suite verified on 4.8) |
 | .NET Core | 2.0 |
 | .NET | 5 / 6 / 7 / 8 / 9 |
 | Mono / Xamarin | All |
@@ -496,6 +499,14 @@ Based on the [mdbtools format specification](https://github.com/mdbtools/mdbtool
 3. **TDEF pages** — table definition chains: column descriptors + names
 4. **Data pages** — row slot arrays → null mask + fixed/variable fields
 5. **LVAL pages** — long-value chains for MEMO and OLE fields
+
+---
+
+## Support the Project
+
+If JetDatabaseReader was useful to you, consider supporting its development:
+
+[![Sponsor](https://img.shields.io/badge/Sponsor-❤️-pink)](https://github.com/sponsors/diegoripera)
 
 ---
 
