@@ -2584,6 +2584,12 @@ namespace JetDatabaseReader
             {
                 switch (col.Type)
                 {
+                    // "R" rather than "G": on .NET Framework "G" gives 15 significant digits
+                    // and silently loses the value — 0.1+0.2 renders as "0.3", which does not
+                    // parse back to what was stored. "R" round-trips on every runtime and leaves
+                    // ordinary values alone (1059.31 stays "1059.31"). The exact digits of a value
+                    // that needs more than 15 still differ between .NET Framework and .NET Core,
+                    // but the value itself survives, which is what the string path is for.
                     case T_BYTE:
                         return row[start].ToString(CultureInfo.InvariantCulture);
                     case T_INT:
@@ -2591,9 +2597,9 @@ namespace JetDatabaseReader
                     case T_LONG:
                         return Ri32(row, start).ToString(CultureInfo.InvariantCulture);
                     case T_FLOAT:
-                        return BitConverter.ToSingle(row, start).ToString("G", CultureInfo.InvariantCulture);
+                        return BitConverter.ToSingle(row, start).ToString("R", CultureInfo.InvariantCulture);
                     case T_DOUBLE:
-                        return BitConverter.ToDouble(row, start).ToString("G", CultureInfo.InvariantCulture);
+                        return BitConverter.ToDouble(row, start).ToString("R", CultureInfo.InvariantCulture);
                     case T_DATETIME:
                         return OaDateToString(BitConverter.ToDouble(row, start));
                     case T_MONEY:

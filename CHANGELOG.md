@@ -28,20 +28,47 @@ repeatedly; on a 228 000-row read that cost **16% of allocations and 18% of peak
 count drifts after deletes, so it is treated strictly as a hint and ignored when implausible for
 the file's size.
 
-### 🧹 API completeness and a known cross-runtime difference
+### 🧹 API completeness
 
 `IAccessReader` was missing `IsPasswordProtected`, `IsEncrypted`, `GetLinkedTables` and
 `OpenLinkedTableSource`, so code written against the interface — which the README recommends
 registering for dependency injection — could not tell whether a database was encrypted or discover
 its linked tables. All four are now on the interface.
 
-> **Known gap, not fixed.** `float` and `double` on the *string* path use the `"G"` format, which
-> on .NET Framework yields 15 significant digits and on .NET Core 3.0+ the shortest
-> round-trippable form. The same database therefore renders some floating-point values differently
-> depending on the runtime, and the test suite runs on .NET 8 while the library's main audience is
-> .NET Framework — so the tests do not observe what those callers get. The typed path is
-> unaffected. Fixing it means choosing `"G17"`/`"G9"`, which is deterministic but verbose for
-> ordinary values; it has not been changed because it could not be verified on .NET Framework here.
+### 🐛 Floating-point text lost precision on .NET Framework
+
+`float` and `double` on the string path used the `"G"` format. On .NET Core that is the shortest
+round-trippable form, but **on .NET Framework it is 15 significant digits, which does not round-trip**:
+a stored `0.1 + 0.2` came back as `"0.3"`, a different number than the one in the file. Verified by
+running the same code on both runtimes — four of ten sample values were lost under .NET Framework
+4.8, none under .NET 8.
+
+They now use `"R"`, which round-trips on every runtime and leaves ordinary values alone —
+`1059.31` is still `"1059.31"`. A value that genuinely needs more than 15 digits still prints
+differently on the two runtimes (`0.33333333333333331` against `0.3333333333333333`), but it is the
+same number on both, which is what the string path is for. `"G17"`/`"G9"` would make the text
+identical everywhere at the cost of rendering `1059.31` as `1059.3099999999999`, which is a worse
+trade for a display and export surface.
+
+A regression test parses the text back and requires it to equal the typed value exactly.
+
+### ✅ Verified against v2.2.0, value by value
+
+Every value the reader produces was dumped from this build and from a worktree at the v2.2.0
+commit, and compared cell by cell — roughly 600 000 values across four databases, both the typed
+and the string path.
+
+- **402 differences, all of them `DateTime`, all identical except the sub-second fraction.**
+  v2.2.0 truncated dates to whole seconds by round-tripping them through
+  `"yyyy-MM-dd HH:mm:ss"`; they are now exact.
+- **Zero differences on the string path.**
+- **Zero cells lost** — 402 on each side, so every difference is a changed value, not a
+  disappearance.
+- Plus five tables in NorthwindTraders that v2.2.0 could not see at all.
+
+Resource lifetime is covered too: 150 open/dispose cycles leak no handles and retain no memory,
+a rejected open releases the file, and abandoning an enumeration mid-stream does not keep its
+reader reachable.
 
 ### 🐛 Defects found by a review pass over this release
 

@@ -125,6 +125,42 @@ namespace JetDatabaseReader.Tests
             }
         }
 
+        [Theory]
+        [MemberData(nameof(TestDatabases.All), MemberType = typeof(TestDatabases))]
+        public void FloatingPointText_RoundTripsToTheTypedValue(string path)
+        {
+            using var reader = TestDatabases.Open(path);
+
+            foreach (TableStat stat in reader.GetTableStats().Where(s => s.ColumnCount > 0).Take(6))
+            {
+                List<ColumnMetadata> meta = reader.GetColumnMetadata(stat.Name);
+                List<int> reals = meta.Select((m, i) => new { m, i })
+                                      .Where(x => x.m.ClrType == typeof(double) || x.m.ClrType == typeof(float))
+                                      .Select(x => x.i).ToList();
+                if (reals.Count == 0) continue;
+
+                List<object[]> typed = reader.StreamRows(stat.Name).Take(200).ToList();
+                List<string[]> text = reader.StreamRowsAsStrings(stat.Name).Take(200).ToList();
+
+                for (int r = 0; r < typed.Count; r++)
+                {
+                    foreach (int c in reals)
+                    {
+                        if (typed[r][c] == DBNull.Value) continue;
+
+                        // The text must recover the value exactly. "G" did not on .NET Framework,
+                        // where it emits 15 significant digits: a stored 0.1+0.2 came back as
+                        // "0.3", which parses to a different number than the one in the file.
+                        double expected = Convert.ToDouble(typed[r][c], CultureInfo.InvariantCulture);
+                        double parsed = double.Parse(text[r][c], NumberStyles.Float, CultureInfo.InvariantCulture);
+
+                        parsed.Should().Be(expected,
+                            because: $"'{stat.Name}'.{meta[c].Name} text must recover the stored value");
+                    }
+                }
+            }
+        }
+
         [Fact]
         public void Dates_KeepTheGregorianYear_UnderANonGregorianCalendar()
         {
