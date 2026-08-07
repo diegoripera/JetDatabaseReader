@@ -7,6 +7,33 @@ This project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Summary against v2.2.0
+
+Measured back-to-back from a worktree at the v2.2.0 commit, median of 7 warm runs. Every scenario
+improved; none regressed.
+
+| Database | Operation | Before | After | |
+|----------|-----------|--------|-------|---|
+| 77 MB | `Open` + `ListTables` | 96.7 ms | 23.5 ms | **4.1×**, −98.6% allocated |
+| 77 MB | `ReadAllTables` | 2.22 s | 1.08 s | 2.1×, −52% allocated |
+| 77 MB | `StreamRows` | 923 ms | 316 ms | 2.9×, −52% allocated |
+| 77 MB | idle reader resident | — | — | −92% |
+| Northwind (23→28 tables) | `ReadAllTables` | 344.4 ms | 14.3 ms | **24.1×**, −98.8% allocated |
+| Northwind | `GetRealRowCount` | 16.0 ms | ~0 ms | −100% allocated |
+| AdventureWorks | `ReadTable` (warm) | 1.4 ms | 0.2 ms | 8.8×, −92% allocated |
+
+Three strategies were tried and **rejected on measurement**, which is worth recording so they are
+not tried again:
+
+- **Usage maps instead of the page sweep.** JET stores a per-table bitmap of owned pages, and
+  using it would have made opening a 2 GB database nearly free. It is stale on real files: on the
+  2 GB database it omits 94 657 pages of one table, some carrying live rows. Trusting it would
+  silently drop 66 164 rows.
+- **Memory-mapping the file for the sweep.** Allocates nothing, but measured 2× slower than block
+  reads (1717 ms vs 841 ms over 2 GB) — the accessors bounds-check every call.
+- **Hand-rolled CBC over a reused ECB transform.** Avoids a per-page cipher object but is 4×
+  slower than letting the platform chain in native code.
+
 ### ⚡ Performance: page→table index
 
 Every read method used to walk the **entire file** to find the pages belonging to its table,
