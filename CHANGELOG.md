@@ -28,6 +28,34 @@ repeatedly; on a 228 000-row read that cost **16% of allocations and 18% of peak
 count drifts after deletes, so it is treated strictly as a hint and ignored when implausible for
 the file's size.
 
+### ⚡ Opening no longer reads the whole file
+
+`MSysObjects` owns pages like any other table, and its own usage map says which. That is the entire
+catalog — a few dozen pages — reachable without touching the rest of the database. Opening used to
+walk every page in the file to find them: on a 2 GB database, half a million page headers read to
+recover a few dozen rows.
+
+Measured back-to-back from a worktree at the previous commit, file cache warmed identically for
+both, median of three warm runs:
+
+| | Before | After |
+|---|--------|-------|
+| `Open` + `ListTables`, 2 GB | 672 ms | **1–2 ms** |
+
+The run order was reversed and the measurement repeated, because the version that sweeps leaves the
+file cached and the one that does not then looks slower than it is. Opening improved by the same
+order of magnitude both ways; the absolute "before" figure moved between 672 ms and 2 286 ms purely
+with cache state, which is why it is quoted from the less favourable ordering.
+
+**A full table scan showed no reliable difference** — 1 806 ms against 6 249 ms in one ordering and
+2 812 ms against 2 692 ms in the other. The two disagree in sign, so the honest reading is that the
+scan is unchanged: both versions read the same pages once the table's are known. The win is in
+opening, which is what a service doing one request per reader pays on every request.
+
+The page index the sweep used to build is no longer created at all, since every table's pages now
+come from its own map. It is still built on the fallback path, for a file whose catalog map cannot
+be read.
+
 ### 🐛 The page sweep returned rows Access does not have
 
 Pages were found by sweeping the file for data pages whose `tdef_pg` names the table. On the 2 GB

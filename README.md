@@ -542,8 +542,25 @@ Based on the [mdbtools format specification](https://github.com/mdbtools/mdbtool
 1. **Page 0** — header: Jet3/Jet4 detection, code page, encryption flag
 2. **Page 2** — `MSysObjects` catalog: table names → TDEF page numbers
 3. **TDEF pages** — table definition chains: column descriptors + names
-4. **Data pages** — row slot arrays → null mask + fixed/variable fields
-5. **LVAL pages** — long-value chains for MEMO and OLE fields
+4. **Usage maps** — the per-table bitmap of owned pages, which is how a table's pages are found
+5. **Data pages** — row slot arrays → null mask + fixed/variable fields
+6. **LVAL pages** — long-value chains for MEMO and OLE fields
+
+Pages come from the usage map rather than from scanning the file for pages tagged with the table,
+because a page can keep the tag after the table releases it. Both the catalog and each table are
+reached this way, so nothing reads the whole file — opening a 2 GB database costs a few page reads.
+
+### Checking against Access
+
+The test suite compares the library's typed path against its own string path, which cannot catch a
+row the library never sees or a field it decodes consistently wrongly — both paths fail together.
+[`tools/JetDatabaseReader.CompareWithAccess`](tools/JetDatabaseReader.CompareWithAccess) reads every
+table through the Access engine as well and reports every disagreement. It needs the ACE OLEDB
+provider, so it is a tool rather than a test; run it when changing the decoder.
+
+```
+dotnet run --project tools/JetDatabaseReader.CompareWithAccess -- yourdatabase.accdb
+```
 
 ---
 

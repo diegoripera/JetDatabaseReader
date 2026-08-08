@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <!-- Windows-only and x64: it loads the ACE OLEDB provider in-process, and the provider's
+         bitness has to match. -->
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <PlatformTarget>x64</PlatformTarget>
+    <Nullable>disable</Nullable>
+    <AssemblyName>compare-with-access</AssemblyName>
+    <IsPackable>false</IsPackable>
+    <!-- CA1416: the platform check is the point of the tool, not something to warn about. -->
+    <NoWarn>$(NoWarn);CA1416</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="System.Data.OleDb" Version="8.0.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\JetDatabaseReader\JetDatabaseReader.csproj" />
+  </ItemGroup>
+</Project>

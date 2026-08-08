@@ -22,6 +22,13 @@ namespace JetDatabaseReader
         public long[] UsagePages;
         public bool UsagePagesResolved;
 
+        /// <summary>
+        /// File length when <see cref="UsagePages"/> was read. Another process may append to the
+        /// database under a long-lived reader, and a map read before that says nothing about the
+        /// pages that came after — so a change in length re-reads it.
+        /// </summary>
+        public long UsageFileLength;
+
         private bool? _hasVariableColumns;
 
         /// <summary>

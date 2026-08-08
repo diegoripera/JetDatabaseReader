@@ -844,67 +844,13 @@ namespace JetDatabaseReader
                 int  catPages    = 0;
                 int  allRows     = 0;
 
-                // This pass already touches every page header, so recording each data page's
-                // owning TDEF costs nothing extra and saves every later read a whole-file scan.
-                var index = new Dictionary<long, List<PageRun>>();
-
                 RowShape msysShape = BuildShape(msys, null);
                 var catScanner = new RowScanner();
                 var catRow = new string[msysShape.Width];
 
-                // This scan only needs eight bytes out of every page — the type and the owning
-                // TDEF — but it has to visit them all. Reading a page at a time means one copy
-                // per page out of the FileStream buffer; reading in blocks and inspecting the
-                // headers where they land removes that copy for all but the catalog's own pages,
-                // which are the only ones whose body is actually used here.
-                byte[] scan = NewScanBuffer();
-                byte[] block = _crypto == null ? new byte[ScanBlockPages * _pgSz] : null;
-
-                for (long first = 3; first < totPages; first += ScanBlockPages)
+                // Decodes one MSysObjects page into the lists above.
+                void ReadCatalogPage(byte[] catalogPage)
                 {
-                    int inBlock = (int)Math.Min(ScanBlockPages, totPages - first);
-                    if (block != null) ReadBlock(first, block, inBlock * _pgSz);
-
-                    for (int i = 0; i < inBlock; i++)
-                    {
-                        long p = first + i;
-
-                        // Encrypted databases decrypt page by page, so they keep the simple path.
-                        byte[] page;
-                        int at;
-                        if (block != null) { page = block; at = i * _pgSz; }
-                        else { page = ReadPageForScan(p, scan); at = 0; }
-
-                        if (page[at] != 0x01) continue;         // data pages only
-
-                        // Same expression the read loops compare against, so the index is an exact
-                        // memoization of their filter — not a heuristic that could miss pages.
-                        long owner = Ri32(page, at + _dpTDefOff);
-                        if (!index.TryGetValue(owner, out List<PageRun> runs))
-                        {
-                            runs = new List<PageRun>();
-                            index[owner] = runs;
-                        }
-                        AppendPage(runs, p);
-
-                        if (owner != 2) continue;               // must belong to MSysObjects
-                        catPages++;
-
-                        // Row decoding requires a buffer that is exactly one page: MEMO, NUMERIC
-                        // and GUID decoding clamp against buffer.Length, and handing them the
-                        // whole block would widen those bounds into the following pages. Always
-                        // lift the page out — there are only a handful of catalog pages.
-                        byte[] catalogPage;
-                        if (block != null)
-                        {
-                            Buffer.BlockCopy(block, at, scan, 0, _pgSz);
-                            catalogPage = scan;
-                        }
-                        else
-                        {
-                            catalogPage = page;
-                        }
-
                     foreach (RowSpan span in EnumerateRowSpans(catalogPage, catScanner))
                     {
                         if (!CrackRow(span.Page, span.Start, span.Size, msysShape, catRow, null)) continue;
@@ -959,6 +905,88 @@ namespace JetDatabaseReader
                         if (tdefPage > 0)
                             result.Add(new CatalogEntry { Name = nameStr, TDefPage = tdefPage });
                     }
+                }
+
+                // MSysObjects owns pages like any other table, and its own usage map says which.
+                // That is the entire catalog: a handful of pages, reached without touching the
+                // rest of the file. Opening used to walk every page of the database to find them —
+                // on a 2 GB file, half a million pages to read a few dozen rows.
+                long[] catalogPages = GetUsagePages(2);
+                Dictionary<long, List<PageRun>> index = null;
+
+                if (catalogPages != null)
+                {
+                    byte[] mapScan = NewScanBuffer();
+                    foreach (long p in catalogPages)
+                    {
+                        byte[] page = ReadPageForScan(p, mapScan);
+                        if (page[0] != 0x01) continue;
+                        if ((long)Ri32(page, _dpTDefOff) != 2) continue;
+                        catPages++;
+                        ReadCatalogPage(page);
+                    }
+                }
+                else
+                {
+                    // No readable map. Fall back to the whole-file sweep, and since it touches
+                    // every page header anyway, record each data page's owning TDEF so the reads
+                    // that follow do not each repeat the walk.
+                    index = new Dictionary<long, List<PageRun>>();
+
+                    // This scan only needs eight bytes out of every page — the type and the owning
+                    // TDEF — but it has to visit them all. Reading a page at a time means one copy
+                    // per page out of the FileStream buffer; reading in blocks and inspecting the
+                    // headers where they land removes that copy for all but the catalog's own
+                    // pages, which are the only ones whose body is actually used here.
+                    byte[] scan = NewScanBuffer();
+                    byte[] block = _crypto == null ? new byte[ScanBlockPages * _pgSz] : null;
+
+                    for (long first = 3; first < totPages; first += ScanBlockPages)
+                    {
+                        int inBlock = (int)Math.Min(ScanBlockPages, totPages - first);
+                        if (block != null) ReadBlock(first, block, inBlock * _pgSz);
+
+                        for (int i = 0; i < inBlock; i++)
+                        {
+                            long p = first + i;
+
+                            // Encrypted databases decrypt page by page, so they keep the simple path.
+                            byte[] page;
+                            int at;
+                            if (block != null) { page = block; at = i * _pgSz; }
+                            else { page = ReadPageForScan(p, scan); at = 0; }
+
+                            if (page[at] != 0x01) continue;         // data pages only
+
+                            // Same expression the read loops compare against, so the index is an
+                            // exact memoization of their filter — not a heuristic that could miss
+                            // pages.
+                            long owner = Ri32(page, at + _dpTDefOff);
+                            if (!index.TryGetValue(owner, out List<PageRun> runs))
+                            {
+                                runs = new List<PageRun>();
+                                index[owner] = runs;
+                            }
+                            AppendPage(runs, p);
+
+                            if (owner != 2) continue;               // must belong to MSysObjects
+                            catPages++;
+
+                            // Row decoding requires a buffer that is exactly one page: MEMO,
+                            // NUMERIC and GUID decoding clamp against buffer.Length, and handing
+                            // them the whole block would widen those bounds into the following
+                            // pages. Always lift the page out — there are only a handful of
+                            // catalog pages.
+                            if (block != null)
+                            {
+                                Buffer.BlockCopy(block, at, scan, 0, _pgSz);
+                                ReadCatalogPage(scan);
+                            }
+                            else
+                            {
+                                ReadCatalogPage(page);
+                            }
+                        }
                     }
                 }
 
@@ -976,26 +1004,41 @@ namespace JetDatabaseReader
                     foreach (LinkedTable l in linked)
                         diag.AppendLine($"  LINK {l}  connect='{l.ConnectionString}'");
                 }
-                int totalRuns = 0;
-                foreach (var kv in index) totalRuns += kv.Value.Count;
-                diag.AppendLine($"Page index: {index.Count} distinct owners, {totalRuns} runs over {totPages} pages");
+                if (index == null)
+                {
+                    diag.AppendLine($"Catalog read from the usage map: {catalogPages.Length} pages, " +
+                                    $"file has {totPages} — no whole-file scan");
+                }
+                else
+                {
+                    int totalRuns = 0;
+                    foreach (var kv in index) totalRuns += kv.Value.Count;
+                    diag.AppendLine($"Page index: {index.Count} distinct owners, {totalRuns} runs over {totPages} pages");
+                }
+
                 if (DiagnosticsEnabled)
                 {
                     foreach (var e in result)
                         diag.AppendLine($"  [{e.Name}] TDEF page {e.TDefPage}");
                 }
 
-                // Trim the growth slack off each list before publishing — List<T> over-allocates
-                // by up to 2x, and this structure outlives the scan.
-                var trimmed = new Dictionary<long, PageRun[]>(index.Count);
-                foreach (var kv in index)
-                    trimmed[kv.Key] = kv.Value.ToArray();
+                Dictionary<long, PageRun[]> trimmed = null;
+                if (index != null)
+                {
+                    // Trim the growth slack off each list before publishing — List<T>
+                    // over-allocates by up to 2x, and this structure outlives the scan.
+                    trimmed = new Dictionary<long, PageRun[]>(index.Count);
+                    foreach (var kv in index)
+                        trimmed[kv.Key] = kv.Value.ToArray();
+                }
 
                 LastDiagnostics = diag.ToString();
 
                 // Publish the index BEFORE the catalog: _catalogCache != null is the fast-path
-                // exit for concurrent callers, and they consult the index right after.
-                Interlocked.Exchange(ref _indexedPages, totPages);
+                // exit for concurrent callers, and they consult the index right after. When the
+                // catalog came from the usage map there is no index — every table's pages come
+                // from its own map, and the sweep is only reached if a table has none.
+                Interlocked.Exchange(ref _indexedPages, trimmed != null ? totPages : 0);
                 _pageIndex = trimmed;
                 _linkedCache = linked;
                 _catalogCache = result;
@@ -1078,10 +1121,17 @@ namespace JetDatabaseReader
             TableDef td = ReadTableDef(tdefPage);
             if (td == null) return null;
 
+            long length = _fs.Length;
+
             lock (_indexLock)
             {
-                if (td.UsagePagesResolved) return td.UsagePages;
+                // Re-read when the file has grown: FileShare.ReadWrite is the default, so another
+                // process can append pages under a long-lived reader, and a map read before that
+                // says nothing about them. Normally a single length comparison.
+                if (td.UsagePagesResolved && td.UsageFileLength == length) return td.UsagePages;
+
                 td.UsagePagesResolved = true;
+                td.UsageFileLength = length;
                 td.UsagePages = ReadUsageMap(td.UsedPagesDp);
                 return td.UsagePages;
             }
@@ -1093,7 +1143,12 @@ namespace JetDatabaseReader
 
             try
             {
-                byte[] row = ReadUsageMapRow(dp);
+                // Read the map's pages fresh rather than through the LRU. This runs once per
+                // table, and again only when the file has grown — and on that second occasion the
+                // whole point is to see bytes that changed since the first, which a cached page
+                // would hide.
+                byte[] scratch = new byte[_pgSz];
+                byte[] row = ReadUsageMapRow(dp, scratch);
                 if (row == null || row.Length < 5) return null;
 
                 var pages = new List<long>();
@@ -1115,11 +1170,10 @@ namespace JetDatabaseReader
                     {
                         uint mapPage = Ru32(row, 1 + i * 4);
                         if (mapPage == 0) continue;
+                        if ((long)mapPage * _pgSz >= _fs.Length) continue;
 
-                        byte[] page = ReadPageCached(mapPage);
-                        if (page == null) continue;
-
-                        AddSetBits(pages, page, 4, _pgSz - 4, (long)i * perPage);
+                        ReadPageInto(mapPage, scratch);
+                        AddSetBits(pages, scratch, 4, _pgSz - 4, (long)i * perPage);
                     }
                 }
                 else return null;
@@ -1150,14 +1204,15 @@ namespace JetDatabaseReader
         /// Reads the row a (page &lt;&lt; 8 | row) pointer names. Same shape as an LVAL row: the
         /// payload runs from the row's offset to the start of whichever row sits above it.
         /// </summary>
-        private byte[] ReadUsageMapRow(uint dp)
+        private byte[] ReadUsageMapRow(uint dp, byte[] scratch)
         {
             long pageNo = dp >> 8;
             int rowIdx  = (int)(dp & 0xFF);
-            if (pageNo <= 0) return null;
+            if (pageNo <= 0 || pageNo * _pgSz >= _fs.Length) return null;
 
-            byte[] page = ReadPageCached(pageNo);
-            if (page == null || page[0] != 0x01) return null;
+            ReadPageInto(pageNo, scratch);
+            byte[] page = scratch;
+            if (page[0] != 0x01) return null;
 
             int numRows = PageRowCount(page);
             if (rowIdx >= numRows) return null;

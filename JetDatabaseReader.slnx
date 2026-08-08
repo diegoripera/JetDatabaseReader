@@ -5,4 +5,5 @@
   <Project Path="JetDatabaseReader.Benchmarks/JetDatabaseReader.Benchmarks.csproj" />
   <Project Path="JetDatabaseReader.Tests/JetDatabaseReader.Tests.csproj" />
   <Project Path="JetDatabaseReader/JetDatabaseReader.csproj" />
+  <Project Path="tools/JetDatabaseReader.CompareWithAccess/JetDatabaseReader.CompareWithAccess.csproj" />
 </Solution>
