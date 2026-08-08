@@ -9,6 +9,19 @@ namespace JetDatabaseReader
         public long RowCount;           // num_rows from TDEF page offset 16
         public bool HasDeletedColumns;  // true if ColNum sequence has gaps
 
+        /// <summary>
+        /// Pointer to the table's usage map — the bitmap of pages it owns — as
+        /// (page &lt;&lt; 8) | row. Zero when the format or the file does not carry one.
+        /// </summary>
+        public uint UsedPagesDp;
+
+        /// <summary>
+        /// The pages the usage map names, ascending; null when it could not be read. Resolved
+        /// once per table and cached here, because every read path asks for it.
+        /// </summary>
+        public long[] UsagePages;
+        public bool UsagePagesResolved;
+
         private bool? _hasVariableColumns;
 
         /// <summary>

@@ -28,24 +28,33 @@ repeatedly; on a 228 000-row read that cost **16% of allocations and 18% of peak
 count drifts after deletes, so it is treated strictly as a hint and ignored when implausible for
 the file's size.
 
-### ⚠️ The page sweep returns rows Access does not — open
+### 🐛 The page sweep returned rows Access does not have
 
-Not fixed. Recorded because it is a correctness issue and it reverses an earlier decision.
-
-Pages are found by sweeping the file for data pages whose `tdef_pg` names the table. On the 2 GB
-sample database that yields **1 677 013 rows where Access yields 1 610 849** — every row Access
+Pages were found by sweeping the file for data pages whose `tdef_pg` names the table. On the 2 GB
+sample database that yielded **1 677 013 rows where Access yields 1 610 849** — every row Access
 has, plus **66 164 extra ones**, all distinct, none a duplicate of anything. They sit on pages
-still tagged with the table's TDEF that the table no longer owns, and Access knows that because it
-consults the table's usage map instead of trusting the tag.
+still tagged with the table's TDEF that the table no longer owns. Nothing was missing; the risk ran
+the other way, and a report built on that table carried 4% rows the database does not contain,
+which is worse than an error because it looks like data.
 
-Nothing is missing; the risk is the other direction. A report built on this table would be
-inflated by 4% with rows the database does not contain, which is worse than an error, because it
-looks like data.
+Pages now come from the table's **usage map** — the bitmap Access itself consults, which is the
+only thing that knows a page has been released. Both encodings are read: the inline form
+(`[0x00][first page][bits…]`) and the reference form (`[0x01][map page]…`, each pointer naming a
+page whose body is a bitmap for the next slice). Where the map cannot be read the sweep still
+answers, so no file reads worse than before.
 
-The fix is to enumerate pages from the table's usage map rather than by sweeping — the approach
-this project measured and rejected on the strength of that same 66 164 figure, read backwards. It
-is a real change to how every read finds its pages, and to the performance work built on the sweep,
-so it is written down here rather than done in passing.
+Measured on every database available before writing any of it: the map is a **strict subset** of
+what the sweep accepts — across five databases there was not one page the map named that the sweep
+would have rejected — so the change can only remove spurious pages, never add any. On the 2 GB
+database the map names 146 562 pages against the sweep's 241 219, and the 94 657 it leaves out
+carry exactly the 66 164 phantom rows.
+
+It is also the cheaper path: seventeen page reads instead of walking 241 219 pages.
+
+This reverses [an earlier decision](#rejected) recorded in this file, which read the same 66 164
+figure backwards and concluded the map was dropping live rows. It was not; it was excluding pages
+the table no longer owns, and the measurement that "proved" otherwise had no oracle and treated the
+sweep as ground truth.
 
 ### 🐛 Five ways the reader disagreed with Access
 
@@ -283,17 +292,16 @@ added to do, which until now had only been asserted.
 Three strategies were tried and **rejected on measurement**, which is worth recording so they are
 not tried again:
 
-- ~~**Usage maps instead of the page sweep.**~~ **This conclusion was wrong — see below.** It was
-  recorded as: "JET stores a per-table bitmap of owned pages … it is stale on real files: on the
-  2 GB database it omits 94 657 pages of one table, some carrying live rows. Trusting it would
-  silently drop 66 164 rows."
+- <a id="rejected"></a>~~**Usage maps instead of the page sweep.**~~ **This conclusion was wrong,
+  and the usage map is now what the reader uses.** It was recorded as: "JET stores a per-table
+  bitmap of owned pages … it is stale on real files: on the 2 GB database it omits 94 657 pages of
+  one table, some carrying live rows. Trusting it would silently drop 66 164 rows."
 
   Those 66 164 rows are not live. Access does not return them: asked for the same table, ACE OLEDB
-  yields 1 610 849 rows and the sweep yields 1 677 013 — every row Access has, plus 66 164 distinct
-  extra ones that are not duplicates of anything. The usage map was right and the sweep is what is
-  wrong; the earlier measurement had no oracle and treated the sweep as ground truth, so it read
-  the map's omissions as data loss when they were the map excluding pages the table no longer owns.
-  See "The page sweep returns rows Access does not" below.
+  yields 1 610 849 rows and the sweep yielded 1 677 013 — every row Access has, plus 66 164 distinct
+  extra ones that are not duplicates of anything. The map was right and the sweep was wrong; the
+  earlier measurement had no oracle and treated the sweep as ground truth, so it read the map's
+  omissions as data loss when they were the map excluding pages the table no longer owns.
 - **Memory-mapping the file for the sweep.** Allocates nothing, but measured 2× slower than block
   reads (1717 ms vs 841 ms over 2 GB) — the accessors bounds-check every call.
 - **Hand-rolled CBC over a reused ECB transform.** Avoids a per-page cipher object but is 4×

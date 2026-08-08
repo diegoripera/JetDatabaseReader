@@ -173,6 +173,49 @@ namespace JetDatabaseReader.Tests
 
         private static bool IsMojibake(char c) => c >= '　' && c <= '鿿';
 
+        // ── Row counts, taken from Access ─────────────────────────────────
+
+        /// <summary>
+        /// Every table of every fixture in the repository, with the count ACE OLEDB reports.
+        /// These pin the page-selection logic from the outside: a change that starts collecting
+        /// pages the table no longer owns, or stops collecting pages it does, moves one of these.
+        ///
+        /// That is not hypothetical. Pages are chosen from the table's usage map because sweeping
+        /// for data pages whose tdef_pg still names the table over-collects — on a 2 GB database
+        /// that was 66 164 rows Access does not have. None of the fixtures here exhibits it, so
+        /// these numbers guard the normal case; the over-collecting case is covered by the
+        /// comparison against ACE recorded in the changelog.
+        /// </summary>
+        [Theory]
+        [InlineData("AdventureLT2008.mdb", "Product", 295)]
+        [InlineData("AdventureLT2008.mdb", "ProductModel", 128)]
+        [InlineData("AdventureLT2008.mdb", "Employee", 290)]
+        [InlineData("Test_Autonumber.accdb", "TableTest", 10)]
+        [InlineData("Jet4_NoPassword.mdb", "Sample", 3)]
+        [InlineData("NorthwindTraders.accdb", "Companies", 13)]
+        [InlineData("NorthwindTraders.accdb", "Employees", 10)]
+        [InlineData("NorthwindTraders.accdb", "Learn", 15)]
+        [InlineData("NorthwindTraders.accdb", "MRU", 0)]
+        [InlineData("NorthwindTraders.accdb", "NorthwindFeatures", 39)]
+        [InlineData("NorthwindTraders.accdb", "OrderDetails", 130)]
+        [InlineData("NorthwindTraders.accdb", "Orders", 52)]
+        [InlineData("NorthwindTraders.accdb", "Products", 43)]
+        [InlineData("NorthwindTraders.accdb", "ProductVendors", 47)]
+        [InlineData("NorthwindTraders.accdb", "States", 51)]
+        [InlineData("NorthwindTraders.accdb", "Strings", 49)]
+        [InlineData("NorthwindTraders.accdb", "Titles", 3)]
+        public void RowCount_MatchesAccess(string fixture, string table, int expected)
+        {
+            string path = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, fixture);
+            if (!TestDatabases.IsReadable(path)) return;
+
+            using var reader = TestDatabases.Open(path);
+
+            reader.StreamRows(table).Count().Should().Be(expected);
+            reader.GetRealRowCount(table).Should().Be(expected);
+            reader.ReadTable(table).Rows.Count.Should().Be(expected);
+        }
+
         // ── Zero-length text is not null ──────────────────────────────────
 
         [Fact]

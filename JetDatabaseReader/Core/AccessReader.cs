@@ -85,6 +85,7 @@ namespace JetDatabaseReader
         private readonly int _tdNumCols;    // offset of num_cols    (2 bytes)
         private readonly int _tdNumRealIdx; // offset of num_real_idx (4 bytes)
         private readonly int _tdBlockEnd;   // first byte after table-definition block
+        private readonly int _tdUsedPages;  // offset of used_pages  (4 bytes), -1 when absent
 
         // Column descriptor (per-column, fixed-size block)
         private readonly int _colDescSz;
@@ -260,6 +261,7 @@ namespace JetDatabaseReader
                 _tdNumCols    = 45;
                 _tdNumRealIdx = 51;
                 _tdBlockEnd   = 63;
+                _tdUsedPages  = 55;
 
                 // Column descriptor (25 bytes)
                 _colDescSz    = 25;
@@ -292,6 +294,7 @@ namespace JetDatabaseReader
                 _tdNumCols    = 25;
                 _tdNumRealIdx = 31;
                 _tdBlockEnd   = 43;
+                _tdUsedPages  = 35;
 
                 // Column descriptor (18 bytes)
                 _colDescSz    = 18;
@@ -703,6 +706,8 @@ namespace JetDatabaseReader
 
             int numCols    = Ru16(td, _tdNumCols);
             int numRealIdx = Ri32(td, _tdNumRealIdx);
+            uint usedPages = _tdUsedPages >= 0 && td.Length >= _tdUsedPages + 4
+                             ? Ru32(td, _tdUsedPages) : 0u;
 
             // Safety: corrupt or unusual TDEFs can report absurd index counts
             if (numRealIdx < 0 || numRealIdx > 1000) numRealIdx = 0;
@@ -775,9 +780,10 @@ namespace JetDatabaseReader
 
             return new TableDef 
             { 
-                Columns = cols, 
+                Columns = cols,
                 RowCount = td.Length > 20 ? (long)Ru32(td, 16) : 0,
-                HasDeletedColumns = hasDeletedColumns
+                HasDeletedColumns = hasDeletedColumns,
+                UsedPagesDp = usedPages
             };
         }
 
@@ -1016,6 +1022,17 @@ namespace JetDatabaseReader
         /// </summary>
         private IEnumerable<long> EnumerateTablePages(long tdefPage)
         {
+            // The usage map is what Access itself consults, and it is the only thing that knows a
+            // page has been released. Sweeping for data pages whose tdef_pg still names the table
+            // finds those too: on a 2 GB sample database that was 94 657 extra pages carrying
+            // 66 164 rows Access does not have — rows that look like data and are not.
+            long[] owned = GetUsagePages(tdefPage);
+            if (owned != null)
+            {
+                for (int i = 0; i < owned.Length; i++) yield return owned[i];
+                yield break;
+            }
+
             GetUserTables();   // builds the index on first call; cached afterwards
 
             Dictionary<long, PageRun[]> index = _pageIndex;
@@ -1041,6 +1058,129 @@ namespace JetDatabaseReader
                         yield return p;
                 }
             }
+        }
+
+        /// <summary>
+        /// The pages a table owns, ascending, from its usage map — or null when the map cannot be
+        /// read, in which case the caller falls back to the page sweep.
+        ///
+        /// Two encodings, both a bitmap of "page N is mine":
+        ///
+        ///   inline    [0x00][first page(4)][bits…]        — one row, one contiguous range
+        ///   reference [0x01][map page(4)]…                — each pointer names a page whose body
+        ///                                                   is a bitmap for the next slice
+        ///
+        /// Resolved once per table. Every read path calls this, and on a 2 GB database the
+        /// reference form costs seventeen page reads against a whole-file sweep.
+        /// </summary>
+        private long[] GetUsagePages(long tdefPage)
+        {
+            TableDef td = ReadTableDef(tdefPage);
+            if (td == null) return null;
+
+            lock (_indexLock)
+            {
+                if (td.UsagePagesResolved) return td.UsagePages;
+                td.UsagePagesResolved = true;
+                td.UsagePages = ReadUsageMap(td.UsedPagesDp);
+                return td.UsagePages;
+            }
+        }
+
+        private long[] ReadUsageMap(uint dp)
+        {
+            if (dp == 0) return null;
+
+            try
+            {
+                byte[] row = ReadUsageMapRow(dp);
+                if (row == null || row.Length < 5) return null;
+
+                var pages = new List<long>();
+
+                if (row[0] == 0x00)
+                {
+                    long first = Ru32(row, 1);
+                    AddSetBits(pages, row, 5, row.Length - 5, first);
+                }
+                else if (row[0] == 0x01)
+                {
+                    // Each pointer covers the same number of pages, whether or not it is present:
+                    // a zero pointer means "none of that slice", not "skip it", so the slice index
+                    // has to come from the position rather than from a running total.
+                    int perPage = (_pgSz - 4) * 8;
+                    int entries = (row.Length - 1) / 4;
+
+                    for (int i = 0; i < entries; i++)
+                    {
+                        uint mapPage = Ru32(row, 1 + i * 4);
+                        if (mapPage == 0) continue;
+
+                        byte[] page = ReadPageCached(mapPage);
+                        if (page == null) continue;
+
+                        AddSetBits(pages, page, 4, _pgSz - 4, (long)i * perPage);
+                    }
+                }
+                else return null;
+
+                if (pages.Count == 0) return null;   // nothing usable — let the sweep answer
+
+                pages.Sort();
+                return pages.ToArray();
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private static void AddSetBits(List<long> into, byte[] b, int offset, int len, long firstPage)
+        {
+            for (int i = 0; i < len; i++)
+            {
+                byte v = b[offset + i];
+                if (v == 0) continue;
+                for (int bit = 0; bit < 8; bit++)
+                    if ((v & (1 << bit)) != 0) into.Add(firstPage + (long)i * 8 + bit);
+            }
+        }
+
+        /// <summary>
+        /// Reads the row a (page &lt;&lt; 8 | row) pointer names. Same shape as an LVAL row: the
+        /// payload runs from the row's offset to the start of whichever row sits above it.
+        /// </summary>
+        private byte[] ReadUsageMapRow(uint dp)
+        {
+            long pageNo = dp >> 8;
+            int rowIdx  = (int)(dp & 0xFF);
+            if (pageNo <= 0) return null;
+
+            byte[] page = ReadPageCached(pageNo);
+            if (page == null || page[0] != 0x01) return null;
+
+            int numRows = PageRowCount(page);
+            if (rowIdx >= numRows) return null;
+
+            int rawOff = Ru16(page, _dpRowsStart + rowIdx * 2);
+            if ((rawOff & 0xC000) != 0) return null;
+
+            int rowStart = rawOff & 0x1FFF;
+            if (rowStart <= 0 || rowStart >= _pgSz) return null;
+
+            int rowEnd = _pgSz - 1;
+            for (int r = 0; r < numRows; r++)
+            {
+                int ofs = Ru16(page, _dpRowsStart + r * 2) & 0x1FFF;
+                if (ofs > rowStart && ofs < rowEnd) rowEnd = ofs - 1;
+            }
+
+            int size = rowEnd - rowStart + 1;
+            if (size <= 0) return null;
+
+            var data = new byte[size];
+            Buffer.BlockCopy(page, rowStart, data, 0, size);
+            return data;
         }
 
         /// <summary>
