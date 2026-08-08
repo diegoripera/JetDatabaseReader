@@ -173,6 +173,42 @@ namespace JetDatabaseReader.Tests
 
         private static bool IsMojibake(char c) => c >= '　' && c <= '鿿';
 
+        // ── Zero-length text is not null ──────────────────────────────────
+
+        [Fact]
+        public void ZeroLengthText_IsNotNull()
+        {
+            if (!TestDatabases.IsReadable(TestDatabases.NorthwindTraders)) return;
+
+            using var reader = TestDatabases.Open(TestDatabases.NorthwindTraders);
+            List<ColumnMetadata> meta = reader.GetColumnMetadata("Titles");
+            int title = meta.FindIndex(m => m.Name == "Title");
+            if (title < 0) return;
+
+            List<object> values = reader.StreamRows("Titles").Select(r => r[title]).ToList();
+
+            // Access stores a zero-length string and a Null as different things, and this column
+            // holds one of each. Mapping both to DBNull lost that distinction — on the sample
+            // production databases it turned 280 468 zero-length cells into nulls.
+            values.Any(v => (v as string)?.Length == 0).Should().BeTrue(
+                because: "a stored zero-length string must come back as an empty string");
+        }
+
+        [Theory]
+        [MemberData(nameof(TestDatabases.Small), MemberType = typeof(TestDatabases))]
+        public void NullText_IsStillNull(string path)
+        {
+            using var reader = TestDatabases.Open(path);
+
+            // The other half of the same guarantee: making empty strings survive must not make
+            // nulls disappear. The row's null mask is what separates them.
+            bool anyNull = reader.ListTables()
+                .SelectMany(t => reader.StreamRows(t).Take(500).Select(r => (row: r, table: t)))
+                .Any(x => x.row.Any(v => v == DBNull.Value));
+
+            anyNull.Should().BeTrue(because: "these databases contain nulls, and they must stay null");
+        }
+
         // ── Multi-page LVAL chains ────────────────────────────────────────
 
         [Fact]

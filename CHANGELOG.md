@@ -88,13 +88,19 @@ LVAL pages came back missing two characters in three places.
 Verified by comparing every value of every table against ACE: **78 tables, 16 databases, row counts
 and cell values now agree**, except for the two documented differences below.
 
-#### Two differences that remain
+#### Zero-length text is no longer reported as null — behaviour change
 
-*Zero-length text reads as null.* Access distinguishes a zero-length string from Null; this library
-maps both to `DBNull.Value`, as it always has. It is visible in real data — `Item Flags` in the
-sample production databases is a zero-length string in all 280 468 rows, and reads as null. This is
-a semantic choice rather than a decoding error, and changing it would change what existing callers
-see, so it is recorded here rather than altered.
+Access stores a zero-length string and a Null as different things, and this library used to map
+both to `DBNull.Value`. It was visible in real data: `Item Flags` in the sample production
+databases is a zero-length string in all 280 468 rows and came back as null.
+
+The typed path now keeps them apart. A column whose null-mask bit is clear is still `DBNull.Value`;
+a column whose bit is set and whose stored length is zero is now `""`. **Callers that test for
+`DBNull.Value` on text columns will see empty strings where they used to see nulls** — that is the
+point of the change, but it is a change. The string path is unaffected: it renders both as `""` and
+always did, because it has nowhere to put the distinction.
+
+#### One difference that remains
 
 *A memo whose first character is U+FEFF loses it.* Compressed text is introduced by the bytes
 FF FE, which is also how a leading byte-order mark encodes in plain UCS-2, and the column

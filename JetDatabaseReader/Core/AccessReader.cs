@@ -2529,21 +2529,28 @@ namespace JetDatabaseReader
 
         private object ReadVarTyped(byte[] row, int start, int len, ColumnInfo col)
         {
-            if (len <= 0) return DBNull.Value;
+            if (len < 0) return DBNull.Value;
             try
             {
                 switch (col.Type)
                 {
+                    // A stored zero-length string is not a null. The row's null mask has already
+                    // spoken — a column whose bit is clear never reaches here — so an empty value
+                    // at this point is a value, and Access keeps the two apart. Collapsing them
+                    // used to turn 280 468 zero-length cells across the sample databases into
+                    // nulls, which is a different fact about the data.
                     case T_TEXT:
-                        return NullIfEmpty(_jet4 ? DecodeJet4Text(row, start, len)
-                                                 : _ansiEncoding.GetString(row, start, len));
+                        return len == 0
+                            ? string.Empty
+                            : (object)(_jet4 ? DecodeJet4Text(row, start, len)
+                                             : _ansiEncoding.GetString(row, start, len));
 
                     case T_BINARY:
-                        return NullIfEmpty(BitConverter.ToString(row, start, len));
+                        return len == 0 ? string.Empty : (object)BitConverter.ToString(row, start, len);
 
                     case T_MEMO:
                     case T_OLE:
-                        return NullIfEmpty(ReadLongValue(row, start, len, col));
+                        return len == 0 ? string.Empty : (object)ReadLongValue(row, start, len, col);
 
                     default:
                         // A fixed-size type stored in the variable area — JET allows it and Access
