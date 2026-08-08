@@ -20,18 +20,33 @@ namespace JetDatabaseReader.Tests
     /// </summary>
     public class PasswordTests
     {
-        // Local-only fixtures, kept out of the repository (see .gitignore). The password is a
-        // throwaway for these test files; it protects nothing of value.
+        // Local-only fixtures, kept out of the repository (see .gitignore). Set
+        // JETDATABASEREADER_FIXTURE_PASSWORD to run these; without it they are skipped, and the
+        // pair in the repository covers the same ground for the Jet4 case.
         private static readonly string JetPasswordDb =
             Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "..", "..", "..", "AdventureLT2008_encrypted.mdb");
 
         private static readonly string AceEncryptedDb =
             Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "..", "..", "..", "NorthwindTraders_encrypted.accdb");
 
-        private const string Password = "This_Pwd_IsReally_dificult_to_guess_123!";
+        /// <summary>
+        /// The password for the two local-only fixtures above, from
+        /// <c>JETDATABASEREADER_FIXTURE_PASSWORD</c>. It is not hard-coded because it is whatever
+        /// the person holding those files chose, and the files are not in the repository — there
+        /// is nothing here for a literal to unlock, and no reason to publish someone's string.
+        /// </summary>
+        private static readonly string Password =
+            Environment.GetEnvironmentVariable("JETDATABASEREADER_FIXTURE_PASSWORD");
 
-        // Access truncates a Jet4 database password to 20 characters when it is set.
-        private const string StoredPassword = "This_Pwd_IsReally_di";
+        /// <summary>
+        /// Access truncates a Jet4 database password to 20 characters when it is set, so this is
+        /// what the file actually stores.
+        /// </summary>
+        private static string StoredPassword =>
+            Password != null && Password.Length > 20 ? Password.Substring(0, 20) : Password;
+
+        private static bool HaveLocalFixture(string path) =>
+            Password != null && File.Exists(path);
 
         // ── Jet4 database password, on fixtures that are in the repository ────
 
@@ -152,7 +167,7 @@ namespace JetDatabaseReader.Tests
         [Fact]
         public void Jet4_WithCorrectPassword_Opens()
         {
-            if (!File.Exists(JetPasswordDb)) return;
+            if (!HaveLocalFixture(JetPasswordDb)) return;
 
             using var reader = AccessReader.Open(JetPasswordDb, new AccessReaderOptions { Password = Password });
 
@@ -163,7 +178,7 @@ namespace JetDatabaseReader.Tests
         [Fact]
         public void Jet4_WithTruncatedPassword_Opens()
         {
-            if (!File.Exists(JetPasswordDb)) return;
+            if (!HaveLocalFixture(JetPasswordDb)) return;
 
             // Supplying exactly what Access stored must work too.
             using var reader = AccessReader.Open(JetPasswordDb,
@@ -175,7 +190,7 @@ namespace JetDatabaseReader.Tests
         [Fact]
         public void Jet4_WithWrongPassword_Throws()
         {
-            if (!File.Exists(JetPasswordDb)) return;
+            if (!HaveLocalFixture(JetPasswordDb)) return;
 
             Action act = () => AccessReader.Open(JetPasswordDb,
                 new AccessReaderOptions { Password = "not the password" });
@@ -186,7 +201,7 @@ namespace JetDatabaseReader.Tests
         [Fact]
         public void Jet4_WithNoPassword_ThrowsAskingForOne()
         {
-            if (!File.Exists(JetPasswordDb)) return;
+            if (!HaveLocalFixture(JetPasswordDb)) return;
 
             Action act = () => AccessReader.Open(JetPasswordDb);
 
@@ -196,7 +211,7 @@ namespace JetDatabaseReader.Tests
         [Fact]
         public void Jet4_ProtectedData_MatchesTheUnprotectedTwin()
         {
-            if (!File.Exists(JetPasswordDb) || !File.Exists(TestDatabases.AdventureWorks)) return;
+            if (!HaveLocalFixture(JetPasswordDb) || !File.Exists(TestDatabases.AdventureWorks)) return;
 
             using var plain = AccessReader.Open(TestDatabases.AdventureWorks);
             using var locked = AccessReader.Open(JetPasswordDb, new AccessReaderOptions { Password = Password });
@@ -243,7 +258,7 @@ namespace JetDatabaseReader.Tests
         [Fact]
         public void AceEncrypted_WithCorrectPassword_Opens()
         {
-            if (!File.Exists(AceEncryptedDb)) return;
+            if (!HaveLocalFixture(AceEncryptedDb)) return;
 
             using var reader = AccessReader.Open(AceEncryptedDb, new AccessReaderOptions { Password = Password });
 
@@ -254,7 +269,7 @@ namespace JetDatabaseReader.Tests
         [Fact]
         public void AceEncrypted_DecryptsToTheSameDataAsThePlainTwin()
         {
-            if (!File.Exists(AceEncryptedDb) || !TestDatabases.IsReadable(TestDatabases.NorthwindTraders)) return;
+            if (!HaveLocalFixture(AceEncryptedDb) || !TestDatabases.IsReadable(TestDatabases.NorthwindTraders)) return;
 
             using var plain = AccessReader.Open(TestDatabases.NorthwindTraders);
             using var encrypted = AccessReader.Open(AceEncryptedDb, new AccessReaderOptions { Password = Password });
@@ -278,7 +293,7 @@ namespace JetDatabaseReader.Tests
         [Fact]
         public void AceEncrypted_WithWrongPassword_Throws()
         {
-            if (!File.Exists(AceEncryptedDb)) return;
+            if (!HaveLocalFixture(AceEncryptedDb)) return;
 
             // Agile encryption stores a verifier, so a wrong password is a definite answer rather
             // than garbage that happens not to parse.
@@ -291,7 +306,7 @@ namespace JetDatabaseReader.Tests
         [Fact]
         public void AceEncrypted_WithNoPassword_ThrowsAskingForOne()
         {
-            if (!File.Exists(AceEncryptedDb)) return;
+            if (!HaveLocalFixture(AceEncryptedDb)) return;
 
             // The failure mode that mattered: before, this opened fine and then reported zero
             // tables, which looks like an empty database rather than an unreadable one.

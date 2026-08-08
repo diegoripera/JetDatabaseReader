@@ -105,11 +105,28 @@ namespace JetDatabaseReader.Benchmarks
                 candidates.Add(Path.Combine(testBin, "NorthwindTraders.accdb"));   //  12 MB
             }
 
-            // Local-only large files (not in the repository).
-            candidates.Add(@"D:\Diego\Downloads\R3188_20260321-20260327_W_PO.mdb");  //  43 MB
-            candidates.Add(@"D:\Diego\Downloads\R419_20260213_D_TR_TPI.mdb");        //  80 MB
-            if (huge)
-                candidates.Add(@"D:\Diego\Downloads\DB Matrix.accdb");               // 2 GB
+            // Larger databases, from JETDATABASEREADER_TEST_DBS: a directory, or a list of paths
+            // separated by Path.PathSeparator. They are the interesting cases for anything that
+            // touches page scanning and none of them can live in a repository, so whoever runs
+            // this points the variable at their own. Pass --db for a one-off.
+            //
+            // Without --huge, anything over a gigabyte is left out: those runs take minutes.
+            string spec = Environment.GetEnvironmentVariable("JETDATABASEREADER_TEST_DBS");
+            if (!string.IsNullOrWhiteSpace(spec))
+            {
+                IEnumerable<string> external = Directory.Exists(spec)
+                    ? Directory.GetFiles(spec, "*.*")
+                        .Where(f => f.EndsWith(".mdb", StringComparison.OrdinalIgnoreCase)
+                                 || f.EndsWith(".accdb", StringComparison.OrdinalIgnoreCase))
+                    : spec.Split(Path.PathSeparator).Select(p => p.Trim()).Where(p => p.Length > 0);
+
+                foreach (string db in external.OrderBy(f => f, StringComparer.OrdinalIgnoreCase))
+                {
+                    if (!File.Exists(db)) continue;
+                    if (!huge && new FileInfo(db).Length > 1L << 30) continue;
+                    candidates.Add(db);
+                }
+            }
 
             return candidates.Where(File.Exists).ToList();
         }

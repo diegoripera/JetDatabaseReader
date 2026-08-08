@@ -7,7 +7,16 @@
 
 Pure-managed .NET library for reading Microsoft Access JET databases — no OleDB, ODBC, or ACE/Jet driver installation required.
 
-> **v2.0** introduced typed DataTables and typed streaming by default. **v2.1** adds structured schema types (`ColumnSize`, `TableStat`, `FirstTableResult`). **v2.2** cleans up the `TableResult` API (`ReadTableAsStrings`, `ToDataTable`, ACCDB encryption fix). See [CHANGELOG.md](CHANGELOG.md) and the [migration guide](#migration-from-v1) for breaking changes.
+> **v3.0** is the first release checked cell by cell against the Access engine itself. That found
+> six decoding defects the library's own tests could not — dropped rows, fabricated `GUID`s,
+> `Decimal` columns returning 24-digit integers, text turning to mojibake after the first accent —
+> so **values change where they were wrong before**. Zero-length text now reads as `""` rather than
+> `DBNull.Value`, and `IAccessReader` gained members. See [CHANGELOG.md](CHANGELOG.md) before
+> upgrading.
+>
+> Earlier: **v2.0** introduced typed DataTables and typed streaming by default; **v2.1** added
+> structured schema types; **v2.2** cleaned up the `TableResult` API. The
+> [migration guide](#migration-from-v1) covers the v1 → v2 moves.
 
 ---
 

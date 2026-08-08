@@ -5,25 +5,73 @@ This project follows [Semantic Versioning](https://semver.org/).
 
 ---
 
-## [Unreleased]
+## [3.0.0] — 2026-08-08
 
-### Summary against v2.2.0
+The first release compared cell by cell against the Access engine itself. That comparison found six
+decoding defects the library's own tests could not, because those tests check its typed path against
+its string path and the two fail together. **Values change where they were wrong before**, so this
+is a major version even though most of it is bug fixes.
 
-Measured back-to-back from a worktree at the v2.2.0 commit, median of 7 warm runs. Every scenario
-improved; none regressed.
+### 🧹 No machine-specific paths in the repository
 
-| Database | Operation | Before | After | |
+The test project and the benchmarks named specific databases in one contributor's `Downloads`
+folder. Those files are not in the repository and never were, so on any other machine the theories
+using them silently covered nothing — and the paths said more about whose machine it was than a
+public repository should.
+
+Both now read `JETDATABASEREADER_TEST_DBS`: a directory, or a list of paths. Unset, the suite runs
+against the fixtures in the repository alone — 337 tests in three seconds, which is what a clean
+clone sees. Configured, the same 541 run as before. The password for the local-only encrypted
+fixtures comes from `JETDATABASEREADER_FIXTURE_PASSWORD` for the same reason.
+
+Two handle-leak tests were rewritten while doing this. They compared `Process.HandleCount` before
+and after — a process-wide counter, with xUnit running test classes in parallel — and one of them
+failed under the load of the large-database runs. They now delete the file afterwards instead:
+Windows refuses to delete a file anything still holds open, which is exact and indifferent to what
+else is running. It is the same correction the memory tests in that file already needed.
+
+### ⚠️ Breaking
+
+| | |
+|---|---|
+| `IAccessReader` gained members | Anything implementing the interface — a mock, a decorator — must add them. This is the only change that breaks the build. |
+| Zero-length text | Now `""` instead of `DBNull.Value`. Code testing text columns for `DBNull.Value` sees empty strings instead. |
+| Row counts | Drop on databases holding pages released without a compact — those rows were never Access's. One sample database returns 66 164 fewer. |
+| `Decimal`, `GUID`, accented text, long memos, date text, `float`/`double` text | All return different values, because the old ones were wrong. Exports, hashes and dedup keys built on them will change. |
+| Databases that were refused | Files wrongly reported as password-protected now open. |
+
+### Measured against v2.2.0
+
+Back-to-back from a worktree at the v2.2.0 commit, file cache warmed identically for both, median
+of 7 warm runs. The run order was then reversed and everything re-measured, because whichever
+version reads more of the file leaves it cached and flatters its own next run. **Both orderings
+agreed on direction in every scenario**; each figure below pairs the fastest "before" with the
+slowest "after", so every ratio is a floor rather than a best case.
+
+| Database | Operation | v2.2.0 | 3.0.0 | |
 |----------|-----------|--------|-------|---|
-| 77 MB | `Open` + `ListTables` | 96.7 ms | 23.5 ms | **4.1×**, −98.6% allocated |
-| 77 MB | `ReadAllTables` | 2.22 s | 1.08 s | 2.1×, −52% allocated |
-| 77 MB | `StreamRows` | 923 ms | 316 ms | 2.9×, −52% allocated |
-| 77 MB | idle reader resident | — | — | −92% |
-| Northwind (23→28 tables) | `ReadAllTables` | 344.4 ms | 14.3 ms | **24.1×**, −98.8% allocated |
-| Northwind | `GetRealRowCount` | 16.0 ms | ~0 ms | −100% allocated |
-| AdventureWorks | `ReadTable` (warm) | 1.4 ms | 0.2 ms | 8.8×, −92% allocated |
+| 80 MB, 228 511 rows | `Open` + `ListTables` | 121.2 ms | **0.4 ms** | **300×** |
+| | `GetRealRowCount` | 334.0 ms | 45.7 ms | 7.3× |
+| | `StreamRows` | 911.3 ms | 369.2 ms | 2.5× |
+| | `ReadTable` | 1 916.7 ms | 1 351.0 ms | 1.4× |
+| | `ReadAllTables` | 1 977.8 ms | 1 427.1 ms | 1.4× |
+| AdventureWorksLT | `Open` + `ListTables` | 2.6 ms | 0.8 ms | 3.3× |
+| | `GetRealRowCount` | 2.7 ms | 0.6 ms | 4.5× |
+| | `ReadTable` | 8.1 ms | 4.5 ms | 1.8× |
+| | `ReadAllTables` | 14.4 ms | 8.3 ms | 1.7× |
+| Northwind † | `Open` + `ListTables` | 19.8 ms | 4.5 ms | 4.4× |
+| | `ReadAllTables` | 430.9 ms | 11.7 ms | 37× |
 
-`ReadTable` and `ReadTableAsStringDataTable` now pre-size the row collection from the TDEF's row
-count. Without a hint `DataTable` grows by doubling, reallocating and copying the whole collection
+† Not the same work on both sides: v2.2.0 finds 23 tables and 500 rows there, 3.0.0 finds 28 tables
+and 611 rows. The five extra tables are ones v2.2.0 could not read at all. It is faster while doing
+strictly more, but it is not a like-for-like ratio and should not be quoted as one.
+
+On a 2 GB database, `Open` + `ListTables` measured 672 ms before and 1–2 ms after — that one is
+against the immediately preceding commit rather than v2.2.0, since v2.2.0 cannot read the file
+without also returning 66 164 rows that are not in it.
+
+`ReadTable` and `ReadTableAsStringDataTable` pre-size the row collection from the TDEF's row count.
+Without a hint `DataTable` grows by doubling, reallocating and copying the whole collection
 repeatedly; on a 228 000-row read that cost **16% of allocations and 18% of peak heap**. The stored
 count drifts after deletes, so it is treated strictly as a hint and ignored when implausible for
 the file's size.
@@ -128,8 +176,8 @@ and cell values now agree**, except for the two documented differences below.
 #### Zero-length text is no longer reported as null — behaviour change
 
 Access stores a zero-length string and a Null as different things, and this library used to map
-both to `DBNull.Value`. It was visible in real data: `Item Flags` in the sample production
-databases is a zero-length string in all 280 468 rows and came back as null.
+both to `DBNull.Value`. It was visible in real data: one text column in a sample database is a
+zero-length string in all 280 468 of its rows, and every one came back as null.
 
 The typed path now keeps them apart. A column whose null-mask bit is clear is still `DBNull.Value`;
 a column whose bit is set and whose stored length is zero is now `""`. **Callers that test for

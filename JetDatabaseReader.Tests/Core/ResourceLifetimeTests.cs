@@ -1,6 +1,5 @@
 using System;
 using System.Collections.Generic;
-using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using FluentAssertions;
@@ -19,28 +18,32 @@ namespace JetDatabaseReader.Tests
 
         [Theory]
         [MemberData(nameof(TestDatabases.Small), MemberType = typeof(TestDatabases))]
-        public void OpeningAndDisposingRepeatedly_LeaksNoHandles(string path)
+        public void OpeningAndDisposingRepeatedly_LeavesTheFileUnlocked(string path)
         {
-            // Warm up so first-use allocations and JIT do not count as growth.
-            for (int i = 0; i < 5; i++)
-                using (var warm = TestDatabases.Open(path)) warm.ListTables();
+            // Windows refuses to delete a file that anything still holds open, which makes the
+            // delete an exact test for "no handle survived" — and one that does not care what the
+            // rest of the test run is doing.
+            //
+            // This used to compare Process.HandleCount before and after. That is a process-wide
+            // counter and xUnit runs test classes in parallel, so it drifted with whatever else
+            // was open and failed intermittently under load. The same mistake, in the same file,
+            // as the memory test that had to be rewritten for the same reason.
+            string copy = Path.Combine(Path.GetTempPath(), $"jdr_cycle_{Guid.NewGuid():N}{Path.GetExtension(path)}");
+            File.Copy(path, copy, overwrite: true);
 
-            Process self = Process.GetCurrentProcess();
-            self.Refresh();
-            int before = self.HandleCount;
+            try
+            {
+                for (int i = 0; i < Cycles; i++)
+                    using (var reader = TestDatabases.Open(copy)) reader.ListTables();
 
-            for (int i = 0; i < Cycles; i++)
-                using (var reader = TestDatabases.Open(path)) reader.ListTables();
-
-            self.Refresh();
-            int after = self.HandleCount;
-
-            // The count moves a little on its own — other threads, the GC, the test host — so this
-            // is a leak check, not an equality check. One leaked handle per open would show up as
-            // roughly Cycles.
-            (after - before).Should().BeLessThan(Cycles / 2,
-                because: $"{Cycles} open/dispose cycles must not accumulate handles " +
-                         $"(before {before}, after {after})");
+                Action delete = () => File.Delete(copy);
+                delete.Should().NotThrow(
+                    because: $"{Cycles} open/dispose cycles must not leave the file held open");
+            }
+            finally
+            {
+                try { File.Delete(copy); } catch { }
+            }
         }
 
         [Theory]
@@ -79,7 +82,7 @@ namespace JetDatabaseReader.Tests
         }
 
         [Fact]
-        public void WrongPassword_RepeatedlyRejected_LeaksNoHandles()
+        public void WrongPassword_RepeatedlyRejected_LeavesTheFileUnlocked()
         {
             string db = TestDatabases.AdventureWorks;
             if (!TestDatabases.IsReadable(db)) return;
@@ -91,10 +94,6 @@ namespace JetDatabaseReader.Tests
 
             try
             {
-                Process self = Process.GetCurrentProcess();
-                self.Refresh();
-                int before = self.HandleCount;
-
                 for (int i = 0; i < Cycles; i++)
                 {
                     try
@@ -106,10 +105,8 @@ namespace JetDatabaseReader.Tests
                     catch { /* a protected database would refuse here — also fine */ }
                 }
 
-                self.Refresh();
-                (self.HandleCount - before).Should().BeLessThan(Cycles / 2);
-
-                // The clincher: nothing still holds the file, so it can be deleted.
+                // Nothing still holds the file, so it can be deleted. Deterministic, unlike the
+                // process-wide handle count this used to compare.
                 Action delete = () => File.Delete(locked);
                 delete.Should().NotThrow();
             }

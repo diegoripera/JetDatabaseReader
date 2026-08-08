@@ -171,21 +171,27 @@ namespace JetDatabaseReader.Tests
             count.Should().BeGreaterThanOrEqualTo(0);
         }
 
-        // ── Matrix (local-only large file) — smoke test ───────────────────
+        // ── External databases — smoke tests ──────────────────────────────
+        //
+        // These need a database large enough for the invariant to mean anything, which is bigger
+        // than anything that can live in a repository. Point JETDATABASEREADER_TEST_DBS at your
+        // own; without it they do not run.
 
         [Fact]
-        public void StreamRows_Matrix_DoesNotRetainRowsItHasYielded()
+        public void StreamRows_LargeFile_DoesNotRetainRowsItHasYielded()
         {
-            string path = TestDatabases.LargeFile;
-            if (!TestDatabases.IsReadable(path)) return; // skip if not present or encrypted
+            foreach (string path in TestDatabases.ExternalPaths) CheckRowsAreReleased(path);
+        }
 
+        private static void CheckRowsAreReleased(string path)
+        {
             using var reader = TestDatabases.Open(path, new AccessReaderOptions { PageCacheSize = 256 });
             string table = reader.GetTableStats().FirstOrDefault(s => s.RowCount > 0).Name
                            ?? reader.ListTables()[0];
 
             // Earlier versions of this test compared GC.GetTotalMemory before and after. That
             // counter is process-wide and xUnit runs test classes in parallel, so it kept picking
-            // up memory held by other tests — including several that read this same 2 GB file —
+            // up memory held by other tests — including several reading this same large file —
             // and failed intermittently no matter how the deltas were arranged.
             //
             // Assert the actual invariant instead, which is deterministic and immune to whatever
@@ -211,11 +217,13 @@ namespace JetDatabaseReader.Tests
         }
 
         [Fact]
-        public void StreamRows_Matrix_ReadsAllTablesWithoutException()
+        public void StreamRows_LargeFile_ReadsAllTablesWithoutException()
         {
-            string path = TestDatabases.LargeFile;
-            if (!TestDatabases.IsReadable(path)) return; // skip if not present or encrypted
+            foreach (string path in TestDatabases.ExternalPaths) CheckAllTablesRead(path);
+        }
 
+        private static void CheckAllTablesRead(string path)
+        {
             using var reader = TestDatabases.Open(path, new AccessReaderOptions { PageCacheSize = 512 });
             List<string> tables = reader.ListTables();
 

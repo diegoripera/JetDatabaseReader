@@ -26,8 +26,12 @@ Picked up automatically when present:
 
 - `AdventureLT2008.mdb` (1 MB, 3 tables) and `NorthwindTraders.accdb` (11 MB, 23 tables), from the
   test project's output directory — build `JetDatabaseReader.Tests` first so they are copied there.
-- Local-only large files under `D:\Diego\Downloads\`, not part of the repository. Missing files are
-  skipped silently; pass `--db` to point at your own.
+- Anything named by the `JETDATABASEREADER_TEST_DBS` environment variable: a directory, or a list
+  of paths separated by the platform path separator. Files over a gigabyte are skipped unless
+  `--huge` is passed. Pass `--db` for a one-off.
+
+Large real-world databases are worth configuring. The repository fixtures are small enough that a
+whole-file scan looks free on them, which is exactly the class of regression that matters most.
 
 Multi-table databases are the interesting case for anything touching page scanning — a
 single-table database gives every table the whole file, which hides that class of regression.
