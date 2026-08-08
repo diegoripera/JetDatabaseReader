@@ -23,6 +23,16 @@ Both now read `JETDATABASEREADER_TEST_DBS`: a directory, or a list of paths. Uns
 against the fixtures in the repository alone — 337 tests in three seconds, which is what a clean
 clone sees. Configured, the same 541 run as before.
 
+The package itself was carrying them too, where no amount of reading the source would have shown
+it: an assembly records the path its symbols were written to, and a `.pdb` records every source
+file by full path. Both shipped. `DeterministicSourcePaths` now rewrites them to `/_/` for Release
+builds, and SourceLink — already active — maps that to the GitHub URL for the exact commit, so
+stepping into the library works for everyone rather than only on the machine that built it. The
+publish workflow re-opens the finished `.nupkg` and `.snupkg`, scans the binaries, and refuses to
+push if a drive-letter path survived; the check was verified by packing with the fix disabled and
+watching it fail. Illustrative paths in the README and the XML docs are left alone — the first
+version of the check flagged those, which is how it got narrowed to binaries.
+
 Two handle-leak tests were rewritten while doing this. They compared `Process.HandleCount` before
 and after — a process-wide counter, with xUnit running test classes in parallel — and one of them
 failed under the load of the large-database runs. They now delete the file afterwards instead:

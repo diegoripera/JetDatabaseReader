@@ -21,6 +21,22 @@ Breaking: IAccessReader gained members, so implementers must update. Zero-length
     <IncludeSymbols>true</IncludeSymbols>
     <SymbolPackageFormat>snupkg</SymbolPackageFormat>
   </PropertyGroup>
+
+  <!--
+    Rewrite source paths to a repository-relative form in Release output.
+
+    Without this the shipped assembly and its symbols carry the absolute paths of whatever machine
+    built them: the .dll records where its .pdb sat, and the .pdb records every source file by full
+    path. Neither is visible in the source, and both go out with the package. SourceLink is already
+    active, so debuggers resolve the sources from GitHub rather than from those paths — they were
+    only ever telling people about the build machine.
+
+    Release only: a local Debug build keeps real paths so stepping into the library still works.
+  -->
+  <PropertyGroup Condition="'$(Configuration)' == 'Release'">
+    <ContinuousIntegrationBuild>true</ContinuousIntegrationBuild>
+    <DeterministicSourcePaths>true</DeterministicSourcePaths>
+  </PropertyGroup>
   <ItemGroup>
     <None Include="..\README.md" Pack="true" PackagePath="\" />
   </ItemGroup>
