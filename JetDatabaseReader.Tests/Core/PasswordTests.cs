@@ -20,9 +20,8 @@ namespace JetDatabaseReader.Tests
     /// </summary>
     public class PasswordTests
     {
-        // Local-only fixtures, kept out of the repository (see .gitignore). Set
-        // JETDATABASEREADER_FIXTURE_PASSWORD to run these; without it they are skipped, and the
-        // pair in the repository covers the same ground for the Jet4 case.
+        // Local-only fixtures, kept out of the repository (see .gitignore). They are skipped when
+        // absent; the pair in the repository covers the same ground for the Jet4 case.
         private static readonly string JetPasswordDb =
             Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "..", "..", "..", "AdventureLT2008_encrypted.mdb");
 
@@ -30,23 +29,15 @@ namespace JetDatabaseReader.Tests
             Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "..", "..", "..", "NorthwindTraders_encrypted.accdb");
 
         /// <summary>
-        /// The password for the two local-only fixtures above, from
-        /// <c>JETDATABASEREADER_FIXTURE_PASSWORD</c>. It is not hard-coded because it is whatever
-        /// the person holding those files chose, and the files are not in the repository — there
-        /// is nothing here for a literal to unlock, and no reason to publish someone's string.
+        /// The password on those two fixtures. A throwaway invented for them: the files hold
+        /// sample data, they are not in the repository, and it unlocks nothing else.
         /// </summary>
-        private static readonly string Password =
-            Environment.GetEnvironmentVariable("JETDATABASEREADER_FIXTURE_PASSWORD");
+        private const string Password = "This_Pwd_IsReally_dificult_to_guess_123!";
 
-        /// <summary>
-        /// Access truncates a Jet4 database password to 20 characters when it is set, so this is
-        /// what the file actually stores.
-        /// </summary>
-        private static string StoredPassword =>
-            Password != null && Password.Length > 20 ? Password.Substring(0, 20) : Password;
+        /// <summary>Access truncates a Jet4 database password to 20 characters when it is set.</summary>
+        private const string StoredPassword = "This_Pwd_IsReally_di";
 
-        private static bool HaveLocalFixture(string path) =>
-            Password != null && File.Exists(path);
+        private static bool HaveLocalFixture(string path) => File.Exists(path);
 
         // ── Jet4 database password, on fixtures that are in the repository ────
 

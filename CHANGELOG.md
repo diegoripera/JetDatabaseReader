@@ -21,8 +21,7 @@ public repository should.
 
 Both now read `JETDATABASEREADER_TEST_DBS`: a directory, or a list of paths. Unset, the suite runs
 against the fixtures in the repository alone — 337 tests in three seconds, which is what a clean
-clone sees. Configured, the same 541 run as before. The password for the local-only encrypted
-fixtures comes from `JETDATABASEREADER_FIXTURE_PASSWORD` for the same reason.
+clone sees. Configured, the same 541 run as before.
 
 Two handle-leak tests were rewritten while doing this. They compared `Process.HandleCount` before
 and after — a process-wide counter, with xUnit running test classes in parallel — and one of them
