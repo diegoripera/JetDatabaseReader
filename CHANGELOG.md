@@ -5,6 +5,724 @@ This project follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [3.0.0] — 2026-08-08
+
+The first release compared cell by cell against the Access engine itself. That comparison found six
+decoding defects the library's own tests could not, because those tests check its typed path against
+its string path and the two fail together. **Values change where they were wrong before**, so this
+is a major version even though most of it is bug fixes.
+
+### 🧹 No machine-specific paths in the repository
+
+The test project and the benchmarks named specific databases in one contributor's `Downloads`
+folder. Those files are not in the repository and never were, so on any other machine the theories
+using them silently covered nothing — and the paths said more about whose machine it was than a
+public repository should.
+
+Both now read `JETDATABASEREADER_TEST_DBS`: a directory, or a list of paths. Unset, the suite runs
+against the fixtures in the repository alone — 337 tests in three seconds, which is what a clean
+clone sees. Configured, the same 541 run as before.
+
+The package itself was carrying them too, where no amount of reading the source would have shown
+it: an assembly records the path its symbols were written to, and a `.pdb` records every source
+file by full path. Both shipped. `DeterministicSourcePaths` now rewrites them to `/_/` for Release
+builds, and SourceLink — already active — maps that to the GitHub URL for the exact commit, so
+stepping into the library works for everyone rather than only on the machine that built it. The
+publish workflow re-opens the finished `.nupkg` and `.snupkg`, scans the binaries, and refuses to
+push if a drive-letter path survived; the check was verified by packing with the fix disabled and
+watching it fail. Illustrative paths in the README and the XML docs are left alone — the first
+version of the check flagged those, which is how it got narrowed to binaries.
+
+Two handle-leak tests were rewritten while doing this. They compared `Process.HandleCount` before
+and after — a process-wide counter, with xUnit running test classes in parallel — and one of them
+failed under the load of the large-database runs. They now delete the file afterwards instead:
+Windows refuses to delete a file anything still holds open, which is exact and indifferent to what
+else is running. It is the same correction the memory tests in that file already needed.
+
+### ⚠️ Breaking
+
+| | |
+|---|---|
+| `IAccessReader` gained members | Anything implementing the interface — a mock, a decorator — must add them. This is the only change that breaks the build. |
+| Zero-length text | Now `""` instead of `DBNull.Value`. Code testing text columns for `DBNull.Value` sees empty strings instead. |
+| Row counts | Drop on databases holding pages released without a compact — those rows were never Access's. One sample database returns 66 164 fewer. |
+| `Decimal`, `GUID`, accented text, long memos, date text, `float`/`double` text | All return different values, because the old ones were wrong. Exports, hashes and dedup keys built on them will change. |
+| Databases that were refused | Files wrongly reported as password-protected now open. |
+
+### Measured against v2.2.0
+
+Back-to-back from a worktree at the v2.2.0 commit, file cache warmed identically for both, median
+of 7 warm runs. The run order was then reversed and everything re-measured, because whichever
+version reads more of the file leaves it cached and flatters its own next run. **Both orderings
+agreed on direction in every scenario**; each figure below pairs the fastest "before" with the
+slowest "after", so every ratio is a floor rather than a best case.
+
+| Database | Operation | v2.2.0 | 3.0.0 | |
+|----------|-----------|--------|-------|---|
+| 80 MB, 228 511 rows | `Open` + `ListTables` | 121.2 ms | **0.4 ms** | **300×** |
+| | `GetRealRowCount` | 334.0 ms | 45.7 ms | 7.3× |
+| | `StreamRows` | 911.3 ms | 369.2 ms | 2.5× |
+| | `ReadTable` | 1 916.7 ms | 1 351.0 ms | 1.4× |
+| | `ReadAllTables` | 1 977.8 ms | 1 427.1 ms | 1.4× |
+| AdventureWorksLT | `Open` + `ListTables` | 2.6 ms | 0.8 ms | 3.3× |
+| | `GetRealRowCount` | 2.7 ms | 0.6 ms | 4.5× |
+| | `ReadTable` | 8.1 ms | 4.5 ms | 1.8× |
+| | `ReadAllTables` | 14.4 ms | 8.3 ms | 1.7× |
+| Northwind † | `Open` + `ListTables` | 19.8 ms | 4.5 ms | 4.4× |
+| | `ReadAllTables` | 430.9 ms | 11.7 ms | 37× |
+
+† Not the same work on both sides: v2.2.0 finds 23 tables and 500 rows there, 3.0.0 finds 28 tables
+and 611 rows. The five extra tables are ones v2.2.0 could not read at all. It is faster while doing
+strictly more, but it is not a like-for-like ratio and should not be quoted as one.
+
+On a 2 GB database, `Open` + `ListTables` measured 672 ms before and 1–2 ms after — that one is
+against the immediately preceding commit rather than v2.2.0, since v2.2.0 cannot read the file
+without also returning 66 164 rows that are not in it.
+
+`ReadTable` and `ReadTableAsStringDataTable` pre-size the row collection from the TDEF's row count.
+Without a hint `DataTable` grows by doubling, reallocating and copying the whole collection
+repeatedly; on a 228 000-row read that cost **16% of allocations and 18% of peak heap**. The stored
+count drifts after deletes, so it is treated strictly as a hint and ignored when implausible for
+the file's size.
+
+### ⚡ Opening no longer reads the whole file
+
+`MSysObjects` owns pages like any other table, and its own usage map says which. That is the entire
+catalog — a few dozen pages — reachable without touching the rest of the database. Opening used to
+walk every page in the file to find them: on a 2 GB database, half a million page headers read to
+recover a few dozen rows.
+
+Measured back-to-back from a worktree at the previous commit, file cache warmed identically for
+both, median of three warm runs:
+
+| | Before | After |
+|---|--------|-------|
+| `Open` + `ListTables`, 2 GB | 672 ms | **1–2 ms** |
+
+The run order was reversed and the measurement repeated, because the version that sweeps leaves the
+file cached and the one that does not then looks slower than it is. Opening improved by the same
+order of magnitude both ways; the absolute "before" figure moved between 672 ms and 2 286 ms purely
+with cache state, which is why it is quoted from the less favourable ordering.
+
+**A full table scan showed no reliable difference** — 1 806 ms against 6 249 ms in one ordering and
+2 812 ms against 2 692 ms in the other. The two disagree in sign, so the honest reading is that the
+scan is unchanged: both versions read the same pages once the table's are known. The win is in
+opening, which is what a service doing one request per reader pays on every request.
+
+The page index the sweep used to build is no longer created at all, since every table's pages now
+come from its own map. It is still built on the fallback path, for a file whose catalog map cannot
+be read.
+
+### 🐛 The page sweep returned rows Access does not have
+
+Pages were found by sweeping the file for data pages whose `tdef_pg` names the table. On the 2 GB
+sample database that yielded **1 677 013 rows where Access yields 1 610 849** — every row Access
+has, plus **66 164 extra ones**, all distinct, none a duplicate of anything. They sit on pages
+still tagged with the table's TDEF that the table no longer owns. Nothing was missing; the risk ran
+the other way, and a report built on that table carried 4% rows the database does not contain,
+which is worse than an error because it looks like data.
+
+Pages now come from the table's **usage map** — the bitmap Access itself consults, which is the
+only thing that knows a page has been released. Both encodings are read: the inline form
+(`[0x00][first page][bits…]`) and the reference form (`[0x01][map page]…`, each pointer naming a
+page whose body is a bitmap for the next slice). Where the map cannot be read the sweep still
+answers, so no file reads worse than before.
+
+Measured on every database available before writing any of it: the map is a **strict subset** of
+what the sweep accepts — across five databases there was not one page the map named that the sweep
+would have rejected — so the change can only remove spurious pages, never add any. On the 2 GB
+database the map names 146 562 pages against the sweep's 241 219, and the 94 657 it leaves out
+carry exactly the 66 164 phantom rows.
+
+It is also the cheaper path: seventeen page reads instead of walking 241 219 pages.
+
+This reverses [an earlier decision](#rejected) recorded in this file, which read the same 66 164
+figure backwards and concluded the map was dropping live rows. It was not; it was excluding pages
+the table no longer owns, and the measurement that "proved" otherwise had no oracle and treated the
+sweep as ground truth.
+
+### 🐛 Five ways the reader disagreed with Access
+
+Every check up to this point compared the library's two read paths against each other. That cannot
+catch a row the library never sees or a field it decodes consistently wrongly — both paths fail
+identically. Comparing against the **Access engine itself** (ACE OLEDB) over 78 tables in 16
+databases found five real defects, all of which predate this branch.
+
+**Rows vanished from tables with no variable-length columns.** JET writes no `var_len` field when
+every column is fixed, and the reader read one anyway — landing on the tail of the last fixed
+column. Nwind's `Order Details` ends in a `Discount` float: rows with a discount of zero parsed,
+and **838 of 2 155 rows — 39% of the table — were dropped in silence**. The reader's own
+`GetRealRowCount` said 2 155 while `StreamRows` yielded 1 317, which is how visible this was all
+along.
+
+**Every `Decimal` column returned nonsense.** The 17-byte NUMERIC field is a sign byte followed by
+a 128-bit magnitude in four little-endian words stored most-significant-first, and the scale lives
+in the column descriptor, not the row. The old reading took the scale from byte 1 and the
+magnitude from bytes 4..15, which is the layout of nothing: Chinook's `Track.UnitPrice` — 0.99 in
+all 3 503 rows — came back as `467514281804094876155904`.
+
+**Every `GUID` column in AdventureWorksLT was fabricated.** Whether a column sits in the fixed or
+the variable area is decided by the descriptor's FIXED bit and nothing else; the reader decided by
+*type*, on the reasoning that a GUID is 16 bytes so it must be fixed. Access stores those
+`rowguid` columns variably, so the reader read 16 bytes from the unused `offset_F` — zero, the
+first column — and returned GUIDs built out of each row's primary key: `ProductModelID` 1 became
+`00000001-0000-0000-a071-e2400e000080`.
+
+**Text went to mojibake after the first accent.** JET's compressed encoding toggles between 1-byte
+and 2-byte modes on a single NUL, in both directions; leaving 2-byte mode was coded as needing a
+NUL *pair*. The result was a lost byte of alignment rather than a lost character, so everything
+after the first non-Latin-1 character was garbage — `this “Welcome” panel` became
+`this “圀汥潣敭`. Plain ASCII never leaves compressed mode, which is why most values looked fine.
+
+**Long memos lost characters at every page boundary.** A chunk in an LVAL chain is a 4-byte
+pointer followed by payload; the reader skipped 8, treating the first four bytes of text as a
+length field. Four bytes at the head of each chunk is two characters, so a memo spanning three
+LVAL pages came back missing two characters in three places.
+
+Verified by comparing every value of every table against ACE: **78 tables, 16 databases, row counts
+and cell values now agree**, except for the two documented differences below.
+
+#### Zero-length text is no longer reported as null — behaviour change
+
+Access stores a zero-length string and a Null as different things, and this library used to map
+both to `DBNull.Value`. It was visible in real data: one text column in a sample database is a
+zero-length string in all 280 468 of its rows, and every one came back as null.
+
+The typed path now keeps them apart. A column whose null-mask bit is clear is still `DBNull.Value`;
+a column whose bit is set and whose stored length is zero is now `""`. **Callers that test for
+`DBNull.Value` on text columns will see empty strings where they used to see nulls** — that is the
+point of the change, but it is a change. The string path is unaffected: it renders both as `""` and
+always did, because it has nowhere to put the distinction.
+
+#### One difference that remains
+
+*A memo whose first character is U+FEFF loses it.* Compressed text is introduced by the bytes
+FF FE, which is also how a leading byte-order mark encodes in plain UCS-2, and the column
+descriptor carries nothing that tells them apart — compressed and uncompressed columns have
+identical descriptor bytes. mdbtools and jackcess read it the same way. Gating on the descriptor
+flag that looked like it meant "compressed" was tried and turned every compressed memo in a real
+database into mojibake; one lost BOM in six values is the better trade.
+
+### 🧹 Complex columns now say what they are
+
+Attachment, Multi-Value and append-only Memo history columns share type code **`0x12`** — the docs
+said `0x11`, which is not a code Access uses. They keep their values in hidden system tables and
+leave only a 4-byte id in the row, and that id was being surfaced as a `string` under the type name
+`"0x12"`: Northwind's `Employees.Attachments` read as `"01-00-00-00"`.
+
+The reader still does not follow the id into those tables, but the column is now named `"Complex"`
+so a caller can tell it apart from data. The distinction matters because the id looks exactly like
+an ordinary value — 15 such columns exist across the databases on hand, including two in a fixture
+that is in this repository. Ordinary **OLE Object** columns are a different thing and are read in
+full, as before.
+
+### 🐛 Unprotected Jet4 databases were refused as password-protected
+
+The stored database password at 0x42 is obfuscated **twice**: once with the fixed header mask, and
+once with a four-byte value derived from the database's creation date, repeated down the field.
+Only the fixed mask was being applied, and that mask had been recovered from a single passwordless
+file — so it silently carried that one file's creation date inside it.
+
+The consequence was not a cosmetic misreport. Every Jet4 `.mdb` created on a **different day** than
+the reference file decoded to that date difference instead of to zeros, which reads as a password,
+and `AccessReader.Open` refused the file with *"This database has a database password"*. Sweeping
+every `.mdb`/`.accdb` on the development machine, **10 of 24 Jet4 files were being refused** —
+databases that had never had a password set. The reference file itself passed, which is exactly why
+the mask looked correct.
+
+The creation date is now read back out of the header and folded into the mask. Verified against
+databases created on purpose with known passwords of 8, 18 and 20 characters — each decodes to
+exactly what was set — and against 46 real databases spanning creation dates from 2011 to 2026, all
+of which now open. Two of those fixtures are **in the repository** now: the password tests before
+this all depended on local-only files, so a clean clone ran none of them, which is how this
+survived.
+
+Where the header does not hold a date this can read, the decoder refuses to guess and reports no
+password rather than inventing one. Locking a caller out of a file that was never locked is the
+worse failure — and a Jet4 password is access control, not encryption, so nothing is exposed by it.
+
+### 🧹 API completeness
+
+`IAccessReader` was missing `IsPasswordProtected`, `IsEncrypted`, `GetLinkedTables` and
+`OpenLinkedTableSource`, so code written against the interface — which the README recommends
+registering for dependency injection — could not tell whether a database was encrypted or discover
+its linked tables. All four are now on the interface.
+
+### 🐛 Date text dropped the fractional second
+
+The string path rendered dates with a fixed `"yyyy-MM-dd HH:mm:ss"`, which has no room for the
+fraction JET actually stores: **220 of 1 226 date cells** across the test databases lost theirs, so
+`2004-03-11T10:01:36.827` came back as `"2004-03-11 10:01:36"`. Unlike the floating-point loss this
+happened on every runtime, and it predates the release.
+
+The fraction is now appended only when there is one, so a whole-second date renders exactly as it
+always did and nothing else changes. A test parses the text back and requires it to equal the typed
+instant.
+
+### 🐛 Floating-point text lost precision on .NET Framework
+
+`float` and `double` on the string path used the `"G"` format. On .NET Core that is the shortest
+round-trippable form, but **on .NET Framework it is 15 significant digits, which does not round-trip**:
+a stored `0.1 + 0.2` came back as `"0.3"`, a different number than the one in the file. Verified by
+running the same code on both runtimes — four of ten sample values were lost under .NET Framework
+4.8, none under .NET 8.
+
+They now use `"R"`, which round-trips on every runtime and leaves ordinary values alone —
+`1059.31` is still `"1059.31"`. A value that genuinely needs more than 15 digits still prints
+differently on the two runtimes (`0.33333333333333331` against `0.3333333333333333`), but it is the
+same number on both, which is what the string path is for. `"G17"`/`"G9"` would make the text
+identical everywhere at the cost of rendering `1059.31` as `1059.3099999999999`, which is a worse
+trade for a display and export surface.
+
+A regression test parses the text back and requires it to equal the typed value exactly.
+
+### ✅ The suite now runs on .NET Framework too
+
+The tests targeted `net8.0` only, while the library's main audience is .NET Framework — so nothing
+verified what those callers actually get. That is not hypothetical: the floating-point data loss
+below only happens on .NET Framework, and the suite could never have caught it.
+
+`JetDatabaseReader.Tests` now multi-targets `net8.0;net48` and **all 492 tests pass on both**,
+including the culture, encryption, concurrency and resource-lifetime cases. Two tests needed
+adjusting to compile — `KeyValuePair` deconstruction arrived with .NET Core 2.0 — and nothing in
+the library itself had to change.
+
+### ✅ Verified against v2.2.0, value by value
+
+Every value the reader produces was dumped from this build and from a worktree at the v2.2.0
+commit, and compared cell by cell — roughly 600 000 values across four databases, both the typed
+and the string path.
+
+- **402 differences, all of them `DateTime`, all identical except the sub-second fraction.**
+  v2.2.0 truncated dates to whole seconds by round-tripping them through
+  `"yyyy-MM-dd HH:mm:ss"`; they are now exact.
+- **Zero differences on the string path.**
+- **Zero cells lost** — 402 on each side, so every difference is a changed value, not a
+  disappearance.
+- Plus five tables in NorthwindTraders that v2.2.0 could not see at all.
+
+Resource lifetime is covered too: 150 open/dispose cycles leak no handles and retain no memory,
+a rejected open releases the file, and abandoning an enumeration mid-stream does not keep its
+reader reachable.
+
+### 🐛 Defects found by a review pass over this release
+
+Six, all of which had shipped green against the suite.
+
+- **`ListTables()` returned system tables under 66 cultures.** The catalog decides what is a user
+  table by parsing the object type and flags out of text, and did so with the ambient culture.
+  Sixty-six cultures — every Arabic locale among them — use a negative sign that is not `-`, and a
+  system table's flags are negative, so the parse failed, left zero, and the mask let it through.
+  Under `ar-SA` a one-table database listed **fifteen** tables, including `MSysObjects` and every
+  `MSysComplexType_*`. Like the formatting bug below, this predates the release.
+- **DECIMAL/NUMERIC columns read as empty.** A refactor left `ReadNumericValue` returning formatted
+  text instead of the decimal, so the string path blanked every value and the typed path put a
+  boxed string into a `typeof(decimal)` column.
+- **`ReadTableAsync` could not be cancelled once running.** Both `DataTable` paths accepted a
+  `CancellationToken` and never checked it; their loops sit inside the `BeginLoadData` try block and
+  were missed when the others were instrumented. The existing tests only covered the
+  already-cancelled case, which `Task.Run`'s pre-start check satisfies on its own.
+- **A rejected open leaked the file handle.** The constructor opens the file before it can decide to
+  reject it — wrong password, encrypted pages, not a JET database — and did not close it on the way
+  out. Retrying with a different password leaked one handle per attempt.
+- **The blocked catalog sweep aliased a page to the 1 MB block buffer**, widening the bounds clamps
+  that MEMO, NUMERIC and GUID decoding apply against `buffer.Length`. A malformed inline value on a
+  catalog page could read into the following pages of the block instead of being clamped.
+- **A non-JET file reported itself as encrypted.** Format validation now runs before the encryption
+  check, so junk gets `InvalidDataException` about the magic signature rather than a misleading
+  message about encryption.
+
+### 🐛 String reads depended on the machine's locale
+
+`ReadTableAsStrings`, `StreamRowsAsStrings`, `ReadTableAsStringDataTable` and `ReadFirstTable`
+formatted numbers and dates with the ambient culture, so the same database produced different text
+on different machines. Under a Spanish or German locale `1059.3100` came back as `1059,3100`; under
+`ar-SA` the decimal separator was U+066B, which no invariant parser accepts.
+
+Dates were worse than a formatting nuisance — they were **wrong**. The format string was explicit
+but the calendar was not, so a culture whose default calendar is not Gregorian rendered a different
+date: `1998-06-01` became `2541-06-01` under `th-TH` and `1419-02-07` under `ar-SA`.
+
+Every value the string path produces is now formatted with `InvariantCulture`, as is
+`ColumnSize.ToString()`, which ends up in schema output. The typed path was already unaffected —
+it stopped going through strings earlier in this release.
+
+Regression tests read the same table under en-US, es-ES, de-DE, th-TH and ar-SA and require
+byte-identical output, plus that every date and number parses back invariantly. They fail against
+the previous behaviour on all three counts.
+
+`Query(t).Count()` no longer copies every row out only to discard it. Streaming copies each row
+because the caller may keep it; counting keeps nothing, so with no predicate to run there is
+nothing to copy for. Rows are still decoded and validated exactly as `Execute()` does — the count
+is identical — and a 228 000-row count dropped from 167 MB to 135 MB allocated.
+
+The page cache was also checked rather than assumed: on a blob-heavy read it serves **81%** of
+LVAL page lookups at the default 256 pages, and raising it to 1024 changes nothing. The default is
+the right size.
+
+The blob path — LVAL reads, chain assembly, and base64 for OLE — was the last hot route with no
+measurement behind it, because neither large benchmark database contains a populated MEMO or OLE
+cell. Measured on AdventureWorks' `Product` (295 rows, six blob columns including a thumbnail):
+
+| | Time | Allocated |
+|---|------|-----------|
+| All columns | 2.96 ms | 4 274 KB |
+| Blob columns projected away | 0.45 ms | 111 KB |
+| All columns, `OleObjectMode.Placeholder` | 0.80 ms | 257 KB |
+
+So on a table that has them, blobs dominate everything: projecting them away is 6.6× faster and
+uses 38× less memory. That confirms with numbers what the projection and placeholder features were
+added to do, which until now had only been asserted.
+
+Three strategies were tried and **rejected on measurement**, which is worth recording so they are
+not tried again:
+
+- <a id="rejected"></a>~~**Usage maps instead of the page sweep.**~~ **This conclusion was wrong,
+  and the usage map is now what the reader uses.** It was recorded as: "JET stores a per-table
+  bitmap of owned pages … it is stale on real files: on the 2 GB database it omits 94 657 pages of
+  one table, some carrying live rows. Trusting it would silently drop 66 164 rows."
+
+  Those 66 164 rows are not live. Access does not return them: asked for the same table, ACE OLEDB
+  yields 1 610 849 rows and the sweep yielded 1 677 013 — every row Access has, plus 66 164 distinct
+  extra ones that are not duplicates of anything. The map was right and the sweep was wrong; the
+  earlier measurement had no oracle and treated the sweep as ground truth, so it read the map's
+  omissions as data loss when they were the map excluding pages the table no longer owns.
+- **Memory-mapping the file for the sweep.** Allocates nothing, but measured 2× slower than block
+  reads (1717 ms vs 841 ms over 2 GB) — the accessors bounds-check every call.
+- **Hand-rolled CBC over a reused ECB transform.** Avoids a per-page cipher object but is 4×
+  slower than letting the platform chain in native code.
+
+### ⚡ Performance: page→table index
+
+Every read method used to walk the **entire file** to find the pages belonging to its table,
+re-testing each page's owning TDEF. Reading N tables therefore cost N whole-file scans, and
+reading one small table out of a large database read the whole database.
+
+`GetUserTables()` already scans every page once to locate the `MSysObjects` catalog, so it now
+records each data page's owning TDEF while it is there — the index is built for free. All eight
+read paths (`ReadTable` ×3, `ReadTableAsStrings`, `ReadTableAsStringDataTable`, `ReadFirstTable`,
+`StreamRows`, `StreamRowsAsStrings`, `GetRealRowCount`) then visit only their own pages.
+
+Measured with `JetDatabaseReader.Benchmarks` (median of 7 warm runs, back-to-back A/B):
+
+| Database | Operation | Before | After | Speedup |
+|----------|-----------|--------|-------|---------|
+| Northwind (11 MB, 23 tables) | `ReadAllTables` | 318.8 ms | 18.3 ms | **17.5×** |
+| Northwind | `GetRealRowCount` (warm) | 12.8 ms | ~0 ms | **>1000×** |
+| Northwind | `StreamRows` (warm) | 14.1 ms | 0.6 ms | **23.7×** |
+| Northwind | `Open` + `ReadTable` | 27.6 ms | 14.3 ms | 1.9× |
+| AdventureWorks (1 MB, 3 tables) | `ReadAllTables` | 16.9 ms | 10.9 ms | 1.6× |
+| 77 MB, 1 table | any | — | — | ~1.0× (neutral) |
+
+Allocations for `ReadAllTables` on Northwind drop from 290 MB to 14 MB (**−95%**), because pages
+belonging to other tables are no longer read and copied.
+
+Single-table databases are unchanged, as expected: one table owns nearly every page, so there is
+nothing to skip. The index costs one `long` per data page (~4 MB for a 2 GB database) and adds
++0.8% to the catalog scan's allocations.
+
+**Behaviour is unchanged.** The index stores the result of the exact same predicate the read loops
+applied (`page[0] == 0x01 && Ri32(page, tdefOff) == tdefPage`), in the same ascending page order,
+so row content and row order are identical — verified across 4 real databases × 6 operations, all
+returning byte-identical results, plus the full 365-test suite. The loops still re-verify each
+page after reading it, and pages appended by another process (the default `FileShare.ReadWrite`
+allows it) are picked up by an incremental tail scan.
+
+One visible side effect: `IProgress<int>` callbacks now fire once per *table* page instead of once
+per *file* page, so there are far fewer of them. The reported row counts are unchanged.
+
+### ⚡ Performance: constant-memory reading
+
+Follow-up work aimed at hosts with little RAM (small services, Azure App Service). Measured
+against v2.2.0 with `JetDatabaseReader.Benchmarks`, median of 5 warm runs, back-to-back A/B:
+
+| Database | Operation | Time | Allocations | Retained |
+|----------|-----------|------|-------------|----------|
+| Northwind (11 MB, 23 tables) | `ReadAllTables` | 335 ms → 16 ms (**20.5×**) | 291 MB → 2 MB (−99.3%) | — |
+| Northwind | `StreamRows` | 15.4 ms → 0.2 ms (**70.9×**) | −99.3% | — |
+| 77 MB, 228 K rows | `StreamRows` | 683 ms → 300 ms (**2.3×**) | 346 MB → 167 MB (−51.7%) | 256 B |
+| 77 MB | `ListTables` | 115 ms → 78 ms (1.5×) | 79 MB → 80 KB (**−99.9%**) | — |
+| 77 MB | `GetRealRowCount` | 77 ms → 66 ms | 79 MB → ~0 (**−100%**) | — |
+| 77 MB | idle reader resident | — | −99.9% | 1.0 MB → 23 KB (**−97.8%**) |
+| 40 MB | `ReadTable` | 919 ms → 456 ms (**2.0×**) | −45.3% | — |
+
+Every scenario improved on time and allocations. Row counts are byte-identical across 28
+scenarios on four real databases, and the suite is green at 383 tests.
+
+**Reusable page buffer.** `ReadPage` allocated a fresh 4 KB array per page, so allocations scaled
+with file size rather than with the data requested — counting rows in a 77 MB database produced
+79 MB of garbage. Scans now fill one page-sized buffer per operation. Scanned pages no longer
+enter the LRU cache either: a front-to-back scan touches each page once, so caching them only
+evicted the LVAL and TDEF pages that do get reused.
+
+**Typed decoding without the string round-trip.** The typed path formatted every cell as a string
+and parsed it back. Values are now built straight from the row bytes. Besides the allocations,
+this fixes two silent precision losses — see *Behaviour changes* below.
+
+**Column projection.** `StreamRows`, `StreamRowsAsStrings`, `ReadTable`, and
+`ReadTableAsStringDataTable` gained an overload taking column names, and the fluent API gained
+`Query(t).Select("A", "B")`. Unselected columns are never decoded; for MEMO and OLE columns their
+LVAL pages are never even read.
+
+**`IDataReader` cursor.** `CreateDataReader(table, columns?)` returns an `AccessDataReader` that
+holds one row at a time, for `SqlBulkCopy.WriteToServer`, `DataTable.Load`, or a streaming
+exporter. `ReadTable` on the 77 MB database retains 165 MB by construction; the cursor retains
+kilobytes.
+
+**LVAL and OLE.** Multi-page memo chains were assembled into a `List<byte[]>` and then copied
+again, peaking at twice the memo's size; they now fill a single correctly sized buffer. New
+`AccessReaderOptions.OleObjectMode.Placeholder` skips OLE payloads entirely — no LVAL page reads
+and no base64 string, which otherwise costs the blob plus about 1.33× its size.
+
+**Run-length page index.** The index introduced above stored one entry per page. Table pages are
+allocated in extents, so it now stores runs: the 2 GB database's 524 288 pages collapse to 333
+runs, and a reader costs 81 KB to keep open.
+
+**Faster page decoding.** Per-page row-boundary work dropped a four-stage LINQ chain and an
+O(rows²) probe for each row's end offset, in favour of one reusable scratch and a binary search.
+`DataTable` loads are wrapped in `BeginLoadData`/`EndLoadData`.
+
+### 🐛 Concurrency fix: torn reads across threads
+
+`ReadPage` did `_fs.Seek(...)` followed by `_fs.Read(...)` — two calls against one shared file
+position. Two threads using the same reader interleaved them, and each got bytes belonging to the
+other's page. It surfaced as **wrong data, not an exception**: a table would come back with 298
+rows instead of 295, or 110 instead of 128, or a valid TDEF would fail to parse.
+
+Caching one open reader and serving concurrent requests from it is the obvious pattern under IIS
+or App Service, so the Seek+Read pair is now atomic. The regression tests fail without the lock
+and pass with it. An uncontended lock costs far less than the read it guards; benchmark timings
+and allocations are unchanged.
+
+This also makes the following safe on a single shared reader: independent operations from many
+threads, several readers over the same file, and several processes reading the same file. A single
+`IEnumerable` or `AccessDataReader` still belongs to one thread. See the README's
+*Concurrency & hosting* section.
+
+### ✨ New: `Refresh()`
+
+The catalog, page index, and page cache were read once and never re-validated, so a long-lived
+reader kept serving stale data after another process rewrote the database. `Refresh()` drops all
+three. Appended pages were already picked up automatically; this covers pages rewritten in place.
+
+### 🛡️ Robustness
+
+- **Corrupt row counts** — the row-count field on a data page is 16 bits, so a corrupt page could
+  claim 65 535 rows and send the offset table reading past the end of the page buffer. Now clamped
+  to what fits, in row enumeration and in both LVAL readers.
+- **Corrupt memo lengths** — the LVAL chain reader sized its buffer from the memo header, a 3-byte
+  field. A corrupt row claiming 16 MB allocated 16 MB even when the chain held one page. It now
+  starts at 64 KB and grows towards the declared length.
+- **Currency scale preserved** — building the decimal with an explicit scale of 4 rather than
+  dividing by `10000.0m` keeps the trailing zeros the old string round-trip produced (`1.0000`,
+  not `1`). Same numeric value, but the scale is visible through `ToString()` and in a grid.
+- **Dead code removed** — `TypedValueParser` had no remaining callers after typed decoding stopped
+  going through strings.
+
+### ✨ Linked tables
+
+`GetLinkedTables()` returns the tables whose rows live somewhere else, each with its connection
+string, the name it has in the source, and a parsed `Kind` and `SourcePath`. `MSysObjects` object
+types 4 (ODBC) and 6 (file link) were previously discarded along with everything else that was not
+a local table.
+
+They stay out of `ListTables()` on purpose: the rows are not in this file, so reading one as a
+local table would quietly return nothing. `OpenLinkedTableSource(link)` opens the source when it is
+another Access database. ODBC links cannot be followed — that needs a driver, which is the
+dependency this library exists to avoid.
+
+Verified against a real linked database (`Test_Autonumber_linked.accdb`), which promptly exposed a
+wrong assumption: an Access-to-Access link stores its path in the catalog's **`Database`** column
+and leaves `Connect` empty. Only external providers use the `Provider;...;DATABASE=path` form the
+first implementation assumed, so the link parsed as having no source at all. The dedicated column
+now takes precedence and the connection-string clause is the fallback.
+
+ODBC links remain covered by unit tests only — there is no ODBC fixture — but that path is a
+refusal, not a read.
+
+### ✨ Jet4 database passwords (`.mdb`)
+
+`AccessReaderOptions.Password` opens an `.mdb` that has a database password set, and
+`AccessReader.IsPasswordProtected` reports whether one is present.
+
+Worth being precise about what this is: a Jet4 database password is **access control, not
+encryption**. The page bodies are plain text on disk — this library could always have read them,
+and so can any hex editor. The password is verified so callers are not silently handed access they
+did not ask for, but such a file should be treated as unprotected at rest. Access truncates these
+passwords to 20 characters when setting them, so a longer supplied password is compared on the
+same terms.
+
+The layout was recovered from the bytes rather than assumed: XOR-ing the password field of a
+database against the same database without a password yields the password in clear UTF-16LE, which
+gives both the encoding and the fixed 40-byte mask.
+
+That also exposed a bug. The previous check read one byte at `0x62` and tested two bits, calling it
+an encryption flag. `0x62` is **inside** the 40-byte password field at `0x42` — it is the low half
+of the seventeenth character. It behaved like a flag only because an unset password leaves the
+mask's own value there, and would have misreported for passwords whose seventeenth character
+cleared those bits.
+
+### ⚡ Decryption cost, and a self-inflicted regression
+
+The first working decryption built a hash object, a cipher, and a page-sized array **per page**.
+Measured against the same database unencrypted, that cost 17× on time and 42× on allocations —
+50 MB to scan a 12 MB file. The cipher, hash, and scratch buffer are now created once and reused,
+and decryption runs under the lock that already serialises file reads, so no extra synchronisation
+is needed. Allocations for a full scan dropped from 50 MB to 19 MB.
+
+Hand-rolling CBC over a reused ECB transform was tried and rejected on measurement: it removes the
+per-page transform object but the XOR pass in managed code is four times slower than letting the
+platform do the chaining (61 ms vs 15 ms per 3 000 pages; a 64-bit unsafe XOR still lost at 15 ms
+vs 6.5 ms). The platform does it in native code, and that wins.
+
+What remains is the key derivation itself: 100 000 hash iterations, which the format mandates and
+which is the point of a KDF. It runs once per `Open`, is transient Gen0 garbage, and retains
+nothing — so the guidance is to cache the reader rather than open one per request. Deriving with
+an over-long password no longer costs two derivations: since Access stored the truncation, that
+form is tried first.
+
+### ✨ Cancellation
+
+`GetRealRowCount`, `StreamRows`, `StreamRowsAsStrings`, `ReadTableAsync`,
+`ReadTableAsStringDataTableAsync`, and the new `GetRealRowCountAsync` accept a `CancellationToken`,
+checked once per page. The async methods still run the synchronous reader on a pool thread — the
+work is CPU and file I/O, and pages come largely from the OS cache, so there is no true async I/O
+to be had. What the token buys is abandoning a scan that has outlived the request that asked for it.
+
+### 🐛 OLE detection: BMP false positives
+
+BMP was detected from the two bytes `42 4D` scanned over a 512-byte window, so any blob containing
+"BM" was reported as an image. It now also requires the header to be self-consistent — reserved
+field zero, declared size matching what remains, plausible pixel offset.
+
+### 🧹 `ParallelPageReadsEnabled` marked obsolete
+
+It never had an effect; nothing reads it. Marked `[Obsolete]` rather than removed so existing code
+keeps compiling, and the unused `FLAG_FIXED` constant is gone.
+
+### ✨ ACE encryption (`.accdb`) — supported
+
+Encrypted databases now open with `AccessReaderOptions.Password`, and `AccessReader.IsEncrypted`
+reports whether pages are being decrypted. Unlike a Jet4 database password, this is real
+encryption: the pages are ciphertext and are decrypted as they are read.
+
+The scheme is **ECMA-376 agile encryption** — AES-256-CBC, SHA-512, spin count 100 000 — with the
+descriptor sitting in plain text in page 0. Key derivation follows MS-OFFCRYPTO: iterated password
+hashing, the verifier, and unwrapping the package key.
+
+**Access departs from the specification in one place, and it is the whole difficulty.**
+MS-OFFCRYPTO says a segment's `blockKey` is its zero-based index. Access instead uses
+`encodingKey XOR pageNumber`, where the encoding key is four bytes at offset `0x3E` — themselves
+XOR-masked like the rest of the Jet header. An unencrypted database stores zero there, so the mask
+is just what such a file contains; two unrelated unencrypted databases (one `.mdb`, one `.accdb`)
+both hold `FB 8A BC 4E`, which is where that constant comes from.
+
+How this was pinned down, since guessing at a cipher is worthless:
+
+1. The unencrypted twin supplies the plaintext, so each page's true IV is *computed* rather than
+   guessed: `IV = ECB_decrypt(cipher_block0) XOR plain_block0`.
+2. In CBC a wrong IV corrupts only the first block. Pages 2–5 decrypting byte-identical from
+   offset 16 onward proved the package key was already correct and isolated the fault to the IV.
+3. The recovered IVs matched none of the specification's forms, which is what pointed at Access
+   deviating rather than at a bug in the derivation.
+
+Verified by decrypting the whole database and comparing every row of every table against the
+unencrypted twin — decryption is only correct if it reproduces the original exactly.
+
+Access truncates the password to 20 characters for `.accdb` as well, so a longer one is retried
+truncated; the format's verifier makes that a definite test rather than a guess.
+
+### 🐛 Encrypted `.accdb` reported an empty database instead of an error
+
+ACE "Encrypt with Password" encrypts the page bodies. The old flag check was skipped for ACE files,
+so an encrypted `.accdb` opened cleanly and then reported zero tables — indistinguishable from an
+empty database. Page 2 always holds the `MSysObjects` definition, so a page 2 that is not a TDEF
+now raises a `NotSupportedException` naming the cause. ACE decryption itself remains unsupported.
+
+### 🐛 Overflow rows were skipped — five Northwind tables were invisible
+
+A row-offset entry with bit `0x4000` set is not a row: it is a pointer to the page and row that
+actually hold the data, encoded like an LVAL pointer (`page << 8 | rowIndex`). These entries were
+skipped, so those rows were silently dropped.
+
+It mattered most in `MSysObjects`. Forty of NorthwindTraders' catalog rows are overflow rows, and
+following them takes the database from **23 to 28 user tables** — the ones that were invisible are
+`Employees`, `Orders`, `Products`, `PurchaseOrderStatus`, and `Welcome`.
+
+The pointer format was confirmed against real bytes before implementing: in all 18 overflow
+entries across the test databases, the target resolves to a page whose owning TDEF matches the
+source page's. One wrinkle the raw dump exposed — the target row's own offset entry carries the
+`0x8000` bit, which on an ordinary data page means "deleted". On an overflow target it does not;
+the row is live and only reachable through the pointer, so only the position bits are read there.
+
+`GetRealRowCount` now shares the same row enumeration as the read paths, so it can no longer
+disagree with `StreamRows` about which rows exist.
+
+### ⚡ Performance: I/O and parse caching
+
+- **`FileStream` buffering** — reads are one page at a seeked offset, and with the default 4 KB
+  buffer `FileStream` bypassed buffering entirely, issuing one syscall per page. The buffer is now
+  64 KB (`AccessReaderOptions.FileBufferSize`), so a front-to-back scan serves most pages from
+  memory; `FileOptions.SequentialScan` also asks the OS to read ahead. Catalog scans got **3.7×–4.8×**
+  faster, `GetRealRowCount` about **2×**, `ReadAllTables` on Northwind **2.5×**. Cost: 64 KB per
+  open reader.
+- **`TableDef` cache** — the TDEF page chain was re-read and re-parsed on every read, every
+  `GetTableStats`, and every `GetStatistics`. Now parsed once per table and dropped by `Refresh()`.
+- **`DecompressJet4`** — builds the string in one exactly-bounded `char[]` instead of appending to
+  a `StringBuilder` one character at a time.
+
+### 🐛 `ReadFirstTable` returned an empty schema
+
+`FirstTableResult.Schema` was always `new List<TableColumn>()`, so callers got headers and rows but
+never column types. It is now populated from the TDEF like every other read path.
+
+### ⚠️ Behaviour changes
+
+- **`DateTime` keeps sub-second precision.** The typed path used to render dates as
+  `"yyyy-MM-dd HH:mm:ss"` and re-parse them, truncating milliseconds. Values now come from the
+  OLE Automation date directly. Code comparing typed `DateTime`s for exact equality against
+  second-truncated values will see a difference.
+- **`float`/`double` round-trip exactly.** These went through `ToString("G")`, which is lossy on
+  .NET Framework.
+- **`IAccessReader` gained members** (`GetColumnNames`, the projection overloads,
+  `CreateDataReader`). Breaking only for code that implements the interface itself, such as a
+  hand-written test double.
+- `IProgress<int>` callbacks fire per table page rather than per file page, so there are far
+  fewer of them. Reported row counts are unchanged.
+
+### 📝 Documentation fixes
+
+- The README showed `FileShare.Read` as the default; it is and always was `FileShare.ReadWrite`.
+- `ParallelPageReadsEnabled` is documented as having no effect. It is settable on the options and
+  the reader, but nothing reads it. Kept for binary compatibility.
+
+### 🧪 New: `JetDatabaseReader.Benchmarks`
+
+Stopwatch harness for before/after comparison, reporting time, allocations, peak heap, and
+retained memory. Writes TSV so runs can be diffed:
+
+```
+dotnet run -c Release -- --out baseline.tsv
+dotnet run -c Release -- --out after.tsv --compare baseline.tsv
+dotnet run -c Release -- --diag --huge     # per-database index and resident footprint
+```
+
+### 🔧 Fixes
+
+- **Flaky progress test** — `ReadTable_WithProgress_ReportsIncreasingRowCounts` collected
+  `Progress<int>` callbacks into a `List<int>` and enumerated it while thread-pool callbacks could
+  still be adding to it. Now uses a `ConcurrentQueue<int>` and asserts over a snapshot.
+- **Flaky memory test, properly fixed** — `StreamRows_Matrix_DoesNotExceedReasonableMemory`
+  compared `GC.GetTotalMemory` before and after an enumeration. That counter is process-wide and
+  xUnit runs test classes in parallel, so it kept measuring memory held by other tests reading the
+  same 2 GB file. Rearranging the deltas reduced the flakiness but did not remove it — the
+  encryption tests, which allocate ~17 MB each deriving a key, were enough to shift the reading
+  again. It now asserts the invariant directly and deterministically: a `WeakReference` to an
+  early row must be dead after enumeration has moved past it, proving nothing retains yielded
+  rows. Renamed to `StreamRows_Matrix_DoesNotRetainRowsItHasYielded`.
+
+---
+
 ## [2.2.0] — 2026-04-01
 
 ### ⚠️ Breaking Changes

@@ -7,7 +7,16 @@
 
 Pure-managed .NET library for reading Microsoft Access JET databases — no OleDB, ODBC, or ACE/Jet driver installation required.
 
-> **v2.0** introduced typed DataTables and typed streaming by default. **v2.1** adds structured schema types (`ColumnSize`, `TableStat`, `FirstTableResult`). **v2.2** cleans up the `TableResult` API (`ReadTableAsStrings`, `ToDataTable`, ACCDB encryption fix). See [CHANGELOG.md](CHANGELOG.md) and the [migration guide](#migration-from-v1) for breaking changes.
+> **v3.0** is the first release checked cell by cell against the Access engine itself. That found
+> six decoding defects the library's own tests could not — dropped rows, fabricated `GUID`s,
+> `Decimal` columns returning 24-digit integers, text turning to mojibake after the first accent —
+> so **values change where they were wrong before**. Zero-length text now reads as `""` rather than
+> `DBNull.Value`, and `IAccessReader` gained members. See [CHANGELOG.md](CHANGELOG.md) before
+> upgrading.
+>
+> Earlier: **v2.0** introduced typed DataTables and typed streaming by default; **v2.1** added
+> structured schema types; **v2.2** cleaned up the `TableResult` API. The
+> [migration guide](#migration-from-v1) covers the v1 → v2 moves.
 
 ---
 
@@ -16,7 +25,7 @@ Pure-managed .NET library for reading Microsoft Access JET databases — no OleD
 | | |
 |---|---|
 | ✅ **No native dependencies** | Pure C# — runs anywhere .NET runs |
-| ✅ **Jet3 & Jet4 / ACE** | Access 97 through Access 2019 (`.mdb` / `.accdb`) |
+| ✅ **Jet4 / ACE** | Access 2000 through Access 2019 (`.mdb` / `.accdb`); Jet3 implemented but [untested](#jet3) |
 | ✅ **Typed by default** | `int`, `DateTime`, `decimal`, `Guid` — not just strings |
 | ✅ **All column types** | Text, Integer, Currency, Date/Time, GUID, MEMO, OLE Object, Decimal |
 | ✅ **Streaming API** | Process millions of rows without loading the whole file |
@@ -43,9 +52,12 @@ Install-Package JetDatabaseReader
 
 `JetDatabaseReader` targets **`netstandard2.0`**, which is consumed by every current .NET surface:
 
+The test suite runs on both `net8.0` and `net48`, so behaviour is verified on .NET Framework and
+on modern .NET rather than only the latter.
+
 | Consumer | Minimum version |
 |----------|----------------|
-| .NET Framework | 4.6.1 |
+| .NET Framework | 4.6.1 (suite verified on 4.8) |
 | .NET Core | 2.0 |
 | .NET | 5 / 6 / 7 / 8 / 9 |
 | Mono / Xamarin | All |
@@ -145,6 +157,47 @@ foreach (string[] row in reader.StreamRowsAsStrings("BigTable"))
 
 Null values in typed rows surface as `DBNull.Value`.
 
+### Column projection — read only what you need
+
+Unselected columns are never decoded. For MEMO and OLE columns that also means their LVAL pages
+are never read, and on a table that has them this dominates everything else. Reading
+AdventureWorks' `Product` — 295 rows, six MEMO/OLE columns including a thumbnail image:
+
+| | Time | Allocated |
+|---|------|-----------|
+| All columns | 2.96 ms | 4 274 KB |
+| Blob columns projected away | **0.45 ms** | **111 KB** |
+| All columns, `OleObjectMode.Placeholder` | 0.80 ms | 257 KB |
+
+If a table has blob columns you do not need, projecting them away is worth more than every other
+optimisation in this library combined.
+
+```csharp
+foreach (object[] row in reader.StreamRows("BigTable", new[] { "Id", "Total" }, null))
+{
+    int     id    = (int)row[0];   // indexes follow the projection, not the table
+    decimal total = (decimal)row[1];
+}
+```
+
+Also available on `ReadTable`, `ReadTableAsStringDataTable`, and the fluent `Query(...).Select(...)`.
+
+### Constant-memory export — `IDataReader`
+
+`ReadTable` materialises the whole table: reading a 77 MB database costs about 165 MB of retained
+heap. When you only need to move the data somewhere else, use the cursor — it holds one row at a
+time, so memory stays flat no matter how large the table is:
+
+```csharp
+using var cursor = reader.CreateDataReader("BigTable");
+
+using var bulk = new SqlBulkCopy(connectionString) { DestinationTableName = "dbo.BigTable" };
+bulk.WriteToServer(cursor);          // streams; never materialises the table
+```
+
+It works anywhere `IDataReader` is accepted — `DataTable.Load(cursor)`, CSV writers, and so on.
+Per the `IDataReader` contract, values are valid only until the next `Read()`.
+
 ---
 
 ## Fluent Query API
@@ -170,6 +223,24 @@ IEnumerable<string[]> recent = reader.Query("Orders")
 ---
 
 ## Async Operations
+
+These run the synchronous reader on a pool thread — the work is CPU and file I/O — so what the
+`CancellationToken` overloads buy is the ability to *abandon* a scan. A full read of a large
+database easily outlives the request that started it:
+
+```csharp
+DataTable dt = await reader.ReadTableAsync("Orders", columns: null,
+                                           progress: null, cancellationToken: ct);
+
+long rows = await reader.GetRealRowCountAsync("Orders", ct);
+
+foreach (object[] row in reader.StreamRows("Orders", columns: null, progress: null, ct))
+{
+    // throws OperationCanceledException at the next page boundary once ct is signalled
+}
+```
+
+The token is checked once per page, which is the natural granularity for stopping.
 
 ```csharp
 List<string>                  tables = await reader.ListTablesAsync();
@@ -224,16 +295,69 @@ Console.WriteLine($"Cache hit: {s.PageCacheHitRate}%");
 ```csharp
 var options = new AccessReaderOptions
 {
-    PageCacheSize            = 512,    // pages in LRU cache (default: 256)
-    ParallelPageReadsEnabled = true,   // parallel I/O (default: false)
-    DiagnosticsEnabled       = false,  // verbose logging (default: false)
-    ValidateOnOpen           = true,   // format check on open (default: true)
-    FileAccess               = FileAccess.Read,   // default
-    FileShare                = FileShare.Read,    // default: others may read, writes blocked
-    // FileShare             = FileShare.ReadWrite // use when Access has the file open
+    PageCacheSize      = 512,    // pages in LRU cache (default: 256)
+    FileBufferSize     = 64*1024,// FileStream buffer (default: 65536)
+    DiagnosticsEnabled = false,  // verbose logging (default: false)
+    ValidateOnOpen     = true,   // format check on open (default: true)
+    OleObjectMode      = OleObjectMode.Placeholder,  // skip OLE payloads (default: DataUri)
+    FileAccess         = FileAccess.Read,       // default
+    FileShare          = FileShare.ReadWrite,   // default: another app may hold the file open
 };
 using var reader = AccessReader.Open("database.mdb", options);
 ```
+
+`OleObjectMode.Placeholder` makes OLE columns read as the literal `"(OLE)"` without decoding the
+payload — the blob's LVAL pages are never read and no base64 string is built. Use it when scanning
+a table whose attachments you do not need; `DataUri` (the default) returns a `data:` URI and costs
+the blob plus a string about 1.33x its size.
+
+> `ParallelPageReadsEnabled` exists on the options and the reader but currently has no effect —
+> nothing reads it. It is kept for binary compatibility.
+
+---
+
+## Concurrency & hosting (IIS, Azure App Service)
+
+### What is safe
+
+| Scenario | Safe | Notes |
+|----------|------|-------|
+| One reader shared across threads, independent operations | ✅ | Reads against the shared file handle are serialised internally |
+| Several readers in one process, same file | ✅ | Each owns its own file handle |
+| Several **processes** reading the same file | ✅ | IIS web gardens, multiple App Service instances |
+| Opening while Microsoft Access holds the file | ✅ | Default `FileShare.ReadWrite` |
+| One `IEnumerable` from `StreamRows` enumerated by several threads | ❌ | Enumerate it on one thread, like any `IEnumerable` |
+| One `AccessDataReader` used by several threads | ❌ | One cursor per thread — its row buffer is reused |
+
+### Caching a reader
+
+Opening a database scans the catalog once, so keeping a reader alive is worth it — and it is cheap:
+a reader over a 2 GB database costs about **140 KB** resident, and about **85 KB** over a 77 MB one
+(most of it the 64 KB `FileBufferSize`, which you can lower). Registering one per database as a
+singleton and serving concurrent requests from it is a supported pattern.
+
+```csharp
+services.AddSingleton(_ => AccessReader.Open(@"D:\data\catalog.accdb"));
+```
+
+### Staleness
+
+The catalog, page index, and page cache are read once and never re-validated. Pages **appended**
+by another process are picked up automatically, but pages **rewritten in place** are not — a
+long-lived reader would keep serving the old contents. Call `Refresh()` when you know the file
+changed:
+
+```csharp
+reader.Refresh();   // drops catalog, page index, and page cache
+```
+
+If the database is rewritten frequently, prefer opening a reader per request over caching one.
+
+### Memory
+
+`ReadTable` and `ReadAllTables` materialise everything: a 77 MB database retains about 165 MB as a
+`DataTable`. On a memory-constrained plan use `StreamRows` or `CreateDataReader`, which hold one
+row at a time, and project away columns you do not need.
 
 ---
 
@@ -254,11 +378,111 @@ catch (ObjectDisposedException) { /* reader already disposed */ }
 
 | | |
 |---|---|
-| ❌ Encrypted databases | Remove password in Access (File › Info › Encrypt with Password) |
-| ❌ Attachment fields (0x11) | Rare type added in Access 2007 |
-| ❌ Linked tables | Only local tables are listed |
-| ❌ Overflow rows | Rows spanning multiple pages are skipped |
+| ✅ Jet4 database password (`.mdb`) | Supply it via `AccessReaderOptions.Password` |
+| ✅ ACE encryption (`.accdb`) | Agile encryption (AES) — supply the password the same way |
+| ❌ Complex columns (0x12) | Attachment, Multi-Value and append-only Memo history — see below |
+| ⚠️ Linked tables | Listed with their source; readable only when the source is another Access file |
+| ⚠️ Jet3 (Access 97) | Implemented, but untested against a real file — see below |
 | ❌ Write operations | Read-only library |
+
+### Where the reader differs from Access
+
+Verified against the Access engine itself — row counts and cell values for 78 tables across 16
+databases. One difference remains:
+
+**A memo whose first character is U+FEFF loses it.** JET introduces compressed text with the bytes
+`FF FE`, which is also how a leading byte-order mark encodes in plain UCS-2, and nothing in the
+column descriptor separates the two cases. Every JET reader has this ambiguity.
+
+### Nulls and empty strings
+
+Access stores a zero-length string and a Null as different things, and the typed path keeps them
+apart: `DBNull.Value` for a null, `""` for a stored empty string. The string path renders both as
+`""`, because it has nowhere to put the distinction.
+
+### Complex columns
+
+Access 2007 added three column kinds that do not store their values in the row: **Attachment**,
+**Multi-Value**, and append-only **Memo** history. All three share type code `0x12`, and the row
+holds only a 4-byte id pointing into hidden system tables.
+
+Those tables are not followed. The column reports `TypeName == "Complex"` and its value is that id
+rendered as bytes — `"01-00-00-00"` — which is **not** the attachment. Check `TypeName` before
+treating such a column as data:
+
+```csharp
+foreach (ColumnMetadata col in reader.GetColumnMetadata("Employees"))
+    if (col.TypeName == "Complex")
+        { /* the values live elsewhere — skip, or read them with the ACE provider */ }
+```
+
+Northwind's `Employees.Attachments` and `ProductCategories.ProductCategoryImage` are examples.
+Ordinary **OLE Object** columns are unaffected — those are stored in the row's LVAL chain and are
+read normally, including image and document detection.
+
+### Jet3
+
+The Jet3 page layout is implemented — 2 KB pages and its own TDEF offsets — but every test database
+available is Jet4 or ACE, so **Jet3 has never been exercised against a real file**. It is not a
+format you can produce any more either: Access 2002–2003 already writes Jet4, and the ACE engine
+that ships today refuses to create Jet3 at all ("Could not find installable ISAM"). Treat Jet3
+support as untested rather than as a guarantee, and please open an issue with a sample if you have
+one.
+
+### Linked tables
+
+A linked table appears in the database but its rows live elsewhere, so it is reported separately
+from `ListTables()` — asking to read one as a local table would return nothing:
+
+```csharp
+foreach (LinkedTable link in reader.GetLinkedTables())
+{
+    Console.WriteLine($"{link.Name} -> {link.Kind} {link.SourcePath ?? link.ConnectionString}");
+
+    if (link.IsAccessDatabase)
+    {
+        using AccessReader source = reader.OpenLinkedTableSource(link);
+        foreach (object[] row in source.StreamRows(link.ForeignName)) { /* ... */ }
+    }
+}
+```
+
+Links to another Access database can be followed. ODBC links cannot — that needs a driver, which is
+the dependency this library exists to avoid — and Excel or text sources are not JET databases; for
+those, `ConnectionString` tells you what to open. Access stores the path as it was when the link
+was made, so a link can point at a drive or share that no longer resolves.
+
+### Password-protected databases
+
+The two kinds of protection are not the same thing:
+
+```csharp
+using var reader = AccessReader.Open("secured.mdb",
+    new AccessReaderOptions { Password = "..." });
+
+reader.IsPasswordProtected;   // true
+```
+
+A **Jet4 database password** (Access 2000–2003, `.mdb`) is access control, not encryption: Access
+refuses to open the file, but the page bodies sit on disk in plain text. This library verifies the
+password and then reads normally — it is not decrypting anything, and any tool reading the file
+directly sees the same data. Treat such a file as unprotected at rest.
+
+**ACE encryption** (Access 2010+, `.accdb`, "Encrypt with Password") is the real thing: ECMA-376
+agile encryption with AES, and the pages are decrypted as they are read. `reader.IsEncrypted` tells
+the two cases apart.
+
+> Opening an encrypted database runs the key derivation the format mandates — 100 000 hash
+> iterations — which takes tens of milliseconds and allocates transiently. That is per `Open`, not
+> per read, so cache the reader rather than opening one per request.
+
+Access truncates a database password to 20 characters when it is set, so a longer password is
+compared and derived on the same terms — you can pass either form.
+
+> **Overflow rows are now supported.** A row-offset entry with bit `0x4000` is a pointer to the
+> page and row actually holding the data; these used to be skipped. It mattered most in
+> `MSysObjects` — 40 of NorthwindTraders' catalog rows are overflow rows, so `Employees`, `Orders`,
+> `Products`, `PurchaseOrderStatus`, and `Welcome` were invisible to `ListTables()` entirely.
 
 ---
 
@@ -327,8 +551,33 @@ Based on the [mdbtools format specification](https://github.com/mdbtools/mdbtool
 1. **Page 0** — header: Jet3/Jet4 detection, code page, encryption flag
 2. **Page 2** — `MSysObjects` catalog: table names → TDEF page numbers
 3. **TDEF pages** — table definition chains: column descriptors + names
-4. **Data pages** — row slot arrays → null mask + fixed/variable fields
-5. **LVAL pages** — long-value chains for MEMO and OLE fields
+4. **Usage maps** — the per-table bitmap of owned pages, which is how a table's pages are found
+5. **Data pages** — row slot arrays → null mask + fixed/variable fields
+6. **LVAL pages** — long-value chains for MEMO and OLE fields
+
+Pages come from the usage map rather than from scanning the file for pages tagged with the table,
+because a page can keep the tag after the table releases it. Both the catalog and each table are
+reached this way, so nothing reads the whole file — opening a 2 GB database costs a few page reads.
+
+### Checking against Access
+
+The test suite compares the library's typed path against its own string path, which cannot catch a
+row the library never sees or a field it decodes consistently wrongly — both paths fail together.
+[`tools/JetDatabaseReader.CompareWithAccess`](tools/JetDatabaseReader.CompareWithAccess) reads every
+table through the Access engine as well and reports every disagreement. It needs the ACE OLEDB
+provider, so it is a tool rather than a test; run it when changing the decoder.
+
+```
+dotnet run --project tools/JetDatabaseReader.CompareWithAccess -- yourdatabase.accdb
+```
+
+---
+
+## Support the Project
+
+If JetDatabaseReader was useful to you, consider supporting its development:
+
+[![Sponsor](https://img.shields.io/badge/Sponsor-❤️-pink)](https://github.com/sponsors/diegoripera)
 
 ---
 

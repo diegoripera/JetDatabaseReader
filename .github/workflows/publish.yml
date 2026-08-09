@@ -30,5 +30,35 @@ jobs:
       - name: List files (debug)
         run: dir ${{ github.workspace }}\nupkg
 
+      # An assembly records where its symbols sat and a .pdb records every source file by full
+      # path, so a package can carry the build machine's directory layout without a trace of it
+      # appearing in the source. DeterministicSourcePaths rewrites those to /_/; this proves it
+      # happened rather than trusting that it did, and refuses to publish if it did not.
+      - name: Refuse to publish a package carrying build-machine paths
+        shell: pwsh
+        run: |
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $bad = @()
+          foreach ($pkg in Get-ChildItem "${{ github.workspace }}\nupkg" -Include *.nupkg,*.snupkg -Recurse) {
+            $zip = [System.IO.Compression.ZipFile]::OpenRead($pkg.FullName)
+            # Binaries only. The README and the XML docs use illustrative paths like
+            # C:\data\catalog.accdb on purpose, and those are not what this is looking for.
+            foreach ($entry in $zip.Entries | Where-Object { $_.FullName -match '\.(dll|pdb|exe)$' }) {
+              $ms = New-Object System.IO.MemoryStream
+              $entry.Open().CopyTo($ms)
+              $text = [System.Text.Encoding]::ASCII.GetString($ms.ToArray())
+              foreach ($m in [regex]::Matches($text, '[A-Za-z]:\\[A-Za-z0-9_\-\\. ]{6,}')) {
+                $bad += "$($pkg.Name) :: $($entry.FullName) :: $($m.Value)"
+              }
+            }
+            $zip.Dispose()
+          }
+          if ($bad.Count -gt 0) {
+            Write-Host "Absolute build paths found in the package:"
+            $bad | Select-Object -Unique -First 20 | ForEach-Object { Write-Host "  $_" }
+            exit 1
+          }
+          Write-Host "No absolute build paths in the package."
+
       - name: Push to NuGet.org
         run: dotnet nuget push "${{ github.workspace }}\nupkg\*.nupkg" --api-key ${{ secrets.NUGET_API_KEY }} --source https://api.nuget.org/v3/index.json --skip-duplicate

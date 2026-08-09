@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Data;
 using System.Linq;
@@ -176,11 +177,11 @@ namespace JetDatabaseReader.Tests
 
             Dictionary<string, DataTable> all = reader.ReadAllTablesAsStrings();
 
-            foreach (var (tableName, dt) in all)
+            foreach (KeyValuePair<string, DataTable> entry in all)
             {
-                foreach (DataColumn col in dt.Columns)
+                foreach (DataColumn col in entry.Value.Columns)
                     col.DataType.Should().Be(typeof(string),
-                        because: $"ReadAllTablesAsStrings column '{tableName}.{col.ColumnName}' should be string");
+                        because: $"ReadAllTablesAsStrings column '{entry.Key}.{col.ColumnName}' should be string");
             }
         }
 
@@ -206,12 +207,16 @@ namespace JetDatabaseReader.Tests
         {
             using var reader = TestDatabases.Open(path);
             string table = reader.ListTables()[0];
-            var reported = new List<int>();
 
-            reader.ReadTable(table, new Progress<int>(reported.Add));
+            // Progress<T> invokes its handler on the thread pool, so callbacks can still be in
+            // flight when ReadTable returns. A plain List<int> would be mutated concurrently and
+            // enumerated mid-add — use a concurrent collection and assert over a snapshot.
+            var reported = new ConcurrentQueue<int>();
+
+            reader.ReadTable(table, new Progress<int>(reported.Enqueue));
 
             // Every reported value should be non-negative; ForEach handles zero callbacks gracefully
-            foreach (int v in reported) v.Should().BeGreaterThanOrEqualTo(0);
+            foreach (int v in reported.ToArray()) v.Should().BeGreaterThanOrEqualTo(0);
         }
     }
 }

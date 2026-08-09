@@ -1,3 +1,4 @@
+using System.Globalization;
 namespace JetDatabaseReader
 {
     /// <summary>
@@ -29,14 +30,19 @@ namespace JetDatabaseReader
         /// <summary>Large-value data stored on LVAL pages (MEMO / OLE).</summary>
         public static readonly ColumnSize Lval = new ColumnSize(null, ColumnSizeUnit.Lval);
 
-        /// <inheritdoc/>
+        /// <summary>
+        /// Describes the size in a form that does not vary with the machine's culture — this text
+        /// ends up in schema output that gets compared and stored.
+        /// </summary>
         public override string ToString()
         {
+            string value = Value?.ToString(CultureInfo.InvariantCulture);
+
             switch (Unit)
             {
-                case ColumnSizeUnit.Bits:     return Value == 1 ? "1 bit"  : $"{Value} bits";
-                case ColumnSizeUnit.Bytes:    return Value == 1 ? "1 byte" : $"{Value} bytes";
-                case ColumnSizeUnit.Chars:    return $"{Value} chars";
+                case ColumnSizeUnit.Bits:     return Value == 1 ? "1 bit"  : $"{value} bits";
+                case ColumnSizeUnit.Bytes:    return Value == 1 ? "1 byte" : $"{value} bytes";
+                case ColumnSizeUnit.Chars:    return $"{value} chars";
                 case ColumnSizeUnit.Variable: return "variable";
                 case ColumnSizeUnit.Lval:     return "LVAL";
                 default:                      return string.Empty;

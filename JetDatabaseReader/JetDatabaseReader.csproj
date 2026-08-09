@@ -4,25 +4,51 @@
     <LangVersion>7.3</LangVersion>
     <Nullable>disable</Nullable>
     <PackageId>JetDatabaseReader</PackageId>
-    <Version>2.2.0</Version>
+    <Version>3.0.0</Version>
     <Authors>Diego Ripera</Authors>
     <Company>Ripera</Company>
-    <Description>Pure-managed reader for Microsoft Access JET databases (.mdb/.accdb). No OleDB, ODBC, or ACE drivers required. v2: typed DataTables and object[] streaming by default.</Description>
+    <Description>Pure-managed reader for Microsoft Access JET databases (.mdb/.accdb). No OleDB, ODBC, or ACE drivers required. Typed DataTables and object[] streaming by default, verified cell-by-cell against the Access engine.</Description>
     <PackageTags>access;jet;mdb;accdb;database;microsoft-access</PackageTags>
     <PackageProjectUrl>https://github.com/diegoripera/JetDatabaseReader</PackageProjectUrl>
     <RepositoryUrl>https://github.com/diegoripera/JetDatabaseReader</RepositoryUrl>
     <RepositoryType>git</RepositoryType>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
     <PackageReadmeFile>README.md</PackageReadmeFile>
-    <PackageReleaseNotes>v2.0.0 — Breaking changes: ReadTable() now returns typed DataTable; StreamRows() now returns IEnumerable&lt;object[]&gt;; factory method AccessReader.Open() required. See CHANGELOG.md for full details.</PackageReleaseNotes>
+    <PackageReleaseNotes>v3.0.0 — Compared cell by cell against the Access engine for the first time, which found six decoding defects that the library's own tests could not: rows dropped from tables with no variable-length columns, Decimal and GUID columns returning fabricated values, text turning to mojibake after the first accent, characters lost at long-value page boundaries, and pages counted that the table no longer owns. Values change where they were wrong before.
+
+Breaking: IAccessReader gained members, so implementers must update. Zero-length text now reads as "" rather than DBNull.Value. Row counts drop on databases holding pages released without compaction. See CHANGELOG.md.</PackageReleaseNotes>
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
     <IncludeSymbols>true</IncludeSymbols>
     <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+  </PropertyGroup>
+
+  <!--
+    Rewrite source paths to a repository-relative form in Release output.
+
+    Without this the shipped assembly and its symbols carry the absolute paths of whatever machine
+    built them: the .dll records where its .pdb sat, and the .pdb records every source file by full
+    path. Neither is visible in the source, and both go out with the package. SourceLink is already
+    active, so debuggers resolve the sources from GitHub rather than from those paths — they were
+    only ever telling people about the build machine.
+
+    Release only: a local Debug build keeps real paths so stepping into the library still works.
+  -->
+  <PropertyGroup Condition="'$(Configuration)' == 'Release'">
+    <ContinuousIntegrationBuild>true</ContinuousIntegrationBuild>
+    <DeterministicSourcePaths>true</DeterministicSourcePaths>
   </PropertyGroup>
   <ItemGroup>
     <None Include="..\README.md" Pack="true" PackagePath="\" />
   </ItemGroup>
   <ItemGroup>
     <PackageReference Include="System.Text.Encoding.CodePages" Version="8.0.0" />
+  </ItemGroup>
+
+  <!-- Lets the tests cover internal parsing helpers directly, so logic that has no public
+       entry point (connection strings, the Jet password field) is still verifiable. -->
+  <ItemGroup>
+    <AssemblyAttribute Include="System.Runtime.CompilerServices.InternalsVisibleTo">
+      <_Parameter1>JetDatabaseReader.Tests</_Parameter1>
+    </AssemblyAttribute>
   </ItemGroup>
 </Project>

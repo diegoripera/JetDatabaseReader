@@ -1,6 +1,6 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
-    <TargetFramework>net8.0</TargetFramework>
+    <TargetFrameworks>net8.0;net48</TargetFrameworks>
     <LangVersion>latest</LangVersion>
     <Nullable>enable</Nullable>
     <IsPackable>false</IsPackable>
@@ -26,6 +26,26 @@
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </None>
     <None Include="NorthwindTraders.accdb">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+    <None Include="Test_Autonumber.accdb">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+    <!-- Contains a type-6 linked table pointing at AdventureLT2008.mdb. The link stores an
+         absolute path from the machine that created it, so following it only works there. -->
+    <None Include="Test_Autonumber_linked.accdb">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+    <!-- A matched pair of empty Jet4 databases holding the same three rows, one with a database
+         password set and one without. They are here because the password fixtures that existed
+         before were local-only, so nothing in a clean clone covered either case — and that is
+         exactly how a bug that refused unprotected databases went unnoticed. Their creation date
+         differs from AdventureLT2008.mdb's, which is the part that matters: the stored password
+         is masked with the creation date, so one file's date proves nothing about another's. -->
+    <None Include="Jet4_NoPassword.mdb">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+    <None Include="Jet4_Password.mdb">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </None>
   </ItemGroup>

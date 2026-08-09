@@ -19,15 +19,77 @@ namespace JetDatabaseReader.Tests
         public static readonly string AdventureWorks =
             Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "AdventureLT2008.mdb");
 
-        // Local-only large file — not added to the project or repository.
-        public const string LargeFile = @"D:\Diego\Downloads\DB Matrix.accdb";
+        /// <summary>
+        /// Single-table database with an autonumber Id column and two Short Text columns
+        /// (Number1, Number2) whose values look like integers but must stay as strings.
+        /// Row 8 of Number1 contains "78/465", which is an intentional non-numeric value
+        /// that proves the columns are Text, not Numeric.
+        /// </summary>
+        public static readonly string AutonumberDb =
+            Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Test_Autonumber.accdb");
 
-        // User's local downloaded .mdb files — not added to the project or repository.
-        // Note: JetDatabaseReader reads these with FileStream; Windows MOTW macro blocking
-        // (Zone.Identifier ADS) does not affect raw file reads — only Access VBA execution.
-        // To unblock for Access: Unblock-File -Path "<path>" in PowerShell.
-        public const string R3188_W_PO  = @"D:\Diego\Downloads\R3188_20260321-20260327_W_PO.mdb";
-        public const string R419_TR_TPI = @"D:\Diego\Downloads\R419_20260213_D_TR_TPI.mdb";
+        /// <summary>
+        /// Holds one local table plus a linked table (MSysObjects type 6) pointing at
+        /// AdventureLT2008.mdb. The link stores the absolute path it had when it was created, so
+        /// the source resolves only on the machine that made it — tests assert on the link's
+        /// metadata always, and follow it only when the target happens to exist.
+        /// </summary>
+        public static readonly string LinkedDb =
+            Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Test_Autonumber_linked.accdb");
+
+        /// <summary>
+        /// A matched pair of Jet4 databases holding the same three rows, one with a database
+        /// password set and one without. Both are in the repository, unlike the older
+        /// password fixtures — the stored password is masked with the database's creation date,
+        /// so a single passwordless file proves nothing about any other file's date.
+        /// </summary>
+        public static readonly string Jet4NoPassword =
+            Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Jet4_NoPassword.mdb");
+
+        /// <summary>Twin of <see cref="Jet4NoPassword"/> with <see cref="Jet4StoredPassword"/> set.</summary>
+        public static readonly string Jet4WithPassword =
+            Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Jet4_Password.mdb");
+
+        /// <summary>
+        /// Exactly 20 characters — Access's limit for a Jet4 database password, which is also the
+        /// case where the stored field is full and carries no NUL terminator.
+        /// </summary>
+        public const string Jet4StoredPassword = "JetPwd_Test_20Chars!";
+
+        /// <summary>
+        /// Extra databases to test against, from the <c>JETDATABASEREADER_TEST_DBS</c> environment
+        /// variable: a directory, or a list of paths separated by <see cref="Path.PathSeparator"/>.
+        ///
+        /// Large real-world files catch things the small fixtures cannot — multi-page long values,
+        /// tables spanning thousands of pages, released pages a compact never reclaimed — but they
+        /// belong to whoever is running the tests and cannot live in the repository. Point the
+        /// variable at your own; when it is unset these sets are simply empty and the theories
+        /// that use them do not run.
+        /// </summary>
+        private static readonly Lazy<string[]> ExternalDbs = new Lazy<string[]>(() =>
+        {
+            string spec = Environment.GetEnvironmentVariable("JETDATABASEREADER_TEST_DBS");
+            if (string.IsNullOrWhiteSpace(spec)) return Array.Empty<string>();
+
+            try
+            {
+                if (Directory.Exists(spec))
+                    return Directory.GetFiles(spec, "*.*")
+                        .Where(f => f.EndsWith(".mdb", StringComparison.OrdinalIgnoreCase)
+                                 || f.EndsWith(".accdb", StringComparison.OrdinalIgnoreCase))
+                        .OrderBy(f => f, StringComparer.OrdinalIgnoreCase)
+                        .ToArray();
+
+                return spec.Split(Path.PathSeparator)
+                           .Select(p => p.Trim())
+                           .Where(p => p.Length > 0)
+                           .ToArray();
+            }
+            catch
+            {
+                return Array.Empty<string>();
+            }
+        });
 
         // ── MemberData sets ───────────────────────────────────────────────
 
@@ -46,23 +108,24 @@ namespace JetDatabaseReader.Tests
             }
         }
 
-        /// <summary>All databases (skips any that don't exist or can't be opened).</summary>
+        /// <summary>The fixtures in the repository plus any external databases configured.</summary>
         public static IEnumerable<object[]> All =>
-            new[] { LargeFile, NorthwindTraders, AdventureWorks, R3188_W_PO, R419_TR_TPI }
+            new[] { NorthwindTraders, AdventureWorks }
+                .Concat(ExternalDbs.Value)
                 .Where(IsReadable)
                 .Select(p => new object[] { p });
 
-        /// <summary>The smaller databases (skips any that can't be opened).</summary>
+        /// <summary>The fixtures in the repository (skips any that can't be opened).</summary>
         public static IEnumerable<object[]> Small =>
             new[] { NorthwindTraders, AdventureWorks }
                 .Where(IsReadable)
                 .Select(p => new object[] { p });
 
-        /// <summary>The user's local downloaded .mdb files (skips any that can't be opened).</summary>
-        public static IEnumerable<object[]> Downloads =>
-            new[] { R3188_W_PO, R419_TR_TPI }
-                .Where(IsReadable)
-                .Select(p => new object[] { p });
+        /// <summary>
+        /// The external databases, if any were configured. Not exposed as MemberData: xUnit fails
+        /// a theory whose data set is empty, and empty is the normal case here.
+        /// </summary>
+        public static IEnumerable<string> ExternalPaths => ExternalDbs.Value.Where(IsReadable);
 
         /// <summary>
         /// All known database files that exist on disk, without an IsReadable check.
@@ -70,7 +133,8 @@ namespace JetDatabaseReader.Tests
         /// (e.g., verifying they are not password-protected).
         /// </summary>
         public static IEnumerable<object[]> AllExisting =>
-            new[] { LargeFile, NorthwindTraders, AdventureWorks, R3188_W_PO, R419_TR_TPI }
+            new[] { NorthwindTraders, AdventureWorks }
+                .Concat(ExternalDbs.Value)
                 .Where(File.Exists)
                 .Select(p => new object[] { p });
 

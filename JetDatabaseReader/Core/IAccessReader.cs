@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Data;
+using System.Threading;
 using System.Threading.Tasks;
 
 namespace JetDatabaseReader
@@ -17,7 +18,8 @@ namespace JetDatabaseReader
         /// <summary>Maximum number of pages to keep in cache. 0 = unlimited, -1 = disabled. Default: 256 (1 MB for 4K pages).</summary>
         int PageCacheSize { get; set; }
 
-        /// <summary>When true, uses parallel processing for reading multiple pages. Can improve performance for large tables. Default: false.</summary>
+        /// <summary>Has no effect. Kept so existing code keeps compiling.</summary>
+        [Obsolete("Has no effect — page reads are serialised on the shared file handle.")]
         bool ParallelPageReadsEnabled { get; set; }
 
         /// <summary>Diagnostic output populated after each call to <see cref="ListTables"/>.</summary>
@@ -107,9 +109,90 @@ namespace JetDatabaseReader
         DataTable ReadTableAsStringDataTable(string tableName = null, IProgress<int> progress = null);
 
         /// <summary>
+        /// True when the database carries a Jet4 database password. That password is access
+        /// control rather than encryption — the page data is stored in plain text either way.
+        /// </summary>
+        bool IsPasswordProtected { get; }
+
+        /// <summary>True when the pages are encrypted and are being decrypted as they are read.</summary>
+        bool IsEncrypted { get; }
+
+        /// <summary>
+        /// Returns the tables that are linked rather than stored here, with the connection string
+        /// and the name each has in its source. They are deliberately absent from
+        /// <see cref="ListTables"/> because their rows are not in this file.
+        /// </summary>
+        List<LinkedTable> GetLinkedTables();
+
+        /// <summary>
+        /// Opens the Access database a linked table points at. The returned reader is a separate
+        /// instance and the caller owns it — dispose it when finished.
+        /// </summary>
+        AccessReader OpenLinkedTableSource(LinkedTable link, AccessReaderOptions options = null);
+
+        /// <summary>
+        /// Drops the catalog, page index, and page cache so the next call re-reads from disk.
+        /// Use when another process may have modified the database under a long-lived reader.
+        /// </summary>
+        void Refresh();
+
+        /// <summary>Returns the column names of the specified table, in table order.</summary>
+        List<string> GetColumnNames(string tableName);
+
+        /// <summary>
         /// Returns rich metadata for all columns in the specified table.
         /// </summary>
         List<ColumnMetadata> GetColumnMetadata(string tableName);
+
+        /// <summary>
+        /// Yields only <paramref name="columns"/>, in the order given, as typed object arrays.
+        /// Unselected columns are never decoded — for MEMO and OLE columns that also means their
+        /// LVAL pages are never read.
+        /// </summary>
+        IEnumerable<object[]> StreamRows(string tableName, IReadOnlyList<string> columns, IProgress<int> progress);
+
+        /// <summary>
+        /// Yields only <paramref name="columns"/>, in the order given, as string arrays.
+        /// </summary>
+        IEnumerable<string[]> StreamRowsAsStrings(string tableName, IReadOnlyList<string> columns, IProgress<int> progress);
+
+        /// <summary>
+        /// Reads only <paramref name="columns"/> into a DataTable with native CLR column types.
+        /// </summary>
+        DataTable ReadTable(string tableName, IReadOnlyList<string> columns, IProgress<int> progress);
+
+        /// <summary>
+        /// Reads only <paramref name="columns"/> into a DataTable of string columns.
+        /// </summary>
+        DataTable ReadTableAsStringDataTable(string tableName, IReadOnlyList<string> columns, IProgress<int> progress);
+
+        /// <summary>
+        /// Opens a forward-only cursor over the table — the constant-memory path for feeding
+        /// <c>SqlBulkCopy</c>, <c>DataTable.Load</c>, or a streaming exporter.
+        /// </summary>
+        AccessDataReader CreateDataReader(string tableName, IReadOnlyList<string> columns = null);
+
+        /// <summary>Counts live rows, stopping when the token is signalled.</summary>
+        long GetRealRowCount(string tableName, CancellationToken cancellationToken);
+
+        /// <summary>Streams typed rows, stopping when the token is signalled.</summary>
+        IEnumerable<object[]> StreamRows(string tableName, IReadOnlyList<string> columns,
+                                         IProgress<int> progress, CancellationToken cancellationToken);
+
+        /// <summary>Streams string rows, stopping when the token is signalled.</summary>
+        IEnumerable<string[]> StreamRowsAsStrings(string tableName, IReadOnlyList<string> columns,
+                                                  IProgress<int> progress, CancellationToken cancellationToken);
+
+        /// <summary>Reads a table into a typed DataTable asynchronously, honouring cancellation.</summary>
+        Task<DataTable> ReadTableAsync(string tableName, IReadOnlyList<string> columns,
+                                       IProgress<int> progress, CancellationToken cancellationToken);
+
+        /// <summary>Reads a table into a string DataTable asynchronously, honouring cancellation.</summary>
+        Task<DataTable> ReadTableAsStringDataTableAsync(string tableName, IReadOnlyList<string> columns,
+                                                        IProgress<int> progress, CancellationToken cancellationToken);
+
+        /// <summary>Counts live rows asynchronously, honouring cancellation.</summary>
+        Task<long> GetRealRowCountAsync(string tableName, CancellationToken cancellationToken);
 
         /// <summary>
         /// Returns statistical information about the database.

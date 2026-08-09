@@ -39,3 +39,7 @@ PUBLISH.md
 # Windows
 Thumbs.db
 Desktop.ini
+
+# Local-only encrypted test fixtures — password-protected, not for distribution
+*_encrypted.mdb
+*_encrypted.accdb

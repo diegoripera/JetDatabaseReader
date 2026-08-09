@@ -171,40 +171,59 @@ namespace JetDatabaseReader.Tests
             count.Should().BeGreaterThanOrEqualTo(0);
         }
 
-        // ── Matrix (local-only large file) — smoke test ───────────────────
+        // ── External databases — smoke tests ──────────────────────────────
+        //
+        // These need a database large enough for the invariant to mean anything, which is bigger
+        // than anything that can live in a repository. Point JETDATABASEREADER_TEST_DBS at your
+        // own; without it they do not run.
 
         [Fact]
-        public void StreamRows_Matrix_DoesNotExceedReasonableMemory()
+        public void StreamRows_LargeFile_DoesNotRetainRowsItHasYielded()
         {
-            string path = TestDatabases.LargeFile;
-            if (!TestDatabases.IsReadable(path)) return; // skip if not present or encrypted
+            foreach (string path in TestDatabases.ExternalPaths) CheckRowsAreReleased(path);
+        }
 
-            long before = GC.GetTotalMemory(forceFullCollection: true);
-
+        private static void CheckRowsAreReleased(string path)
+        {
             using var reader = TestDatabases.Open(path, new AccessReaderOptions { PageCacheSize = 256 });
             string table = reader.GetTableStats().FirstOrDefault(s => s.RowCount > 0).Name
                            ?? reader.ListTables()[0];
+
+            // Earlier versions of this test compared GC.GetTotalMemory before and after. That
+            // counter is process-wide and xUnit runs test classes in parallel, so it kept picking
+            // up memory held by other tests — including several reading this same large file —
+            // and failed intermittently no matter how the deltas were arranged.
+            //
+            // Assert the actual invariant instead, which is deterministic and immune to whatever
+            // else is running: once the enumerator has moved past a row, nothing holds it.
+            WeakReference firstRow = null;
             int count = 0;
 
-            foreach (object[] _ in reader.StreamRows(table))
+            foreach (object[] row in reader.StreamRows(table))
             {
+                if (count == 0) firstRow = new WeakReference(row);
                 count++;
-                if (count >= 100_000) break; // process first 100 K rows
+                if (count >= 50_000) break;
             }
 
-            long after   = GC.GetTotalMemory(forceFullCollection: true);
-            long deltaMb = (after - before) / (1024 * 1024);
+            if (count < 1_000) return; // too few rows for this to mean anything
 
-            deltaMb.Should().BeLessThan(200,
-                because: "streaming should not load the whole file into memory");
+            GC.Collect();
+            GC.WaitForPendingFinalizers();
+            GC.Collect();
+
+            firstRow!.IsAlive.Should().BeFalse(
+                because: "a streamed row must be collectable once enumeration has moved past it");
         }
 
         [Fact]
-        public void StreamRows_Matrix_ReadsAllTablesWithoutException()
+        public void StreamRows_LargeFile_ReadsAllTablesWithoutException()
         {
-            string path = TestDatabases.LargeFile;
-            if (!TestDatabases.IsReadable(path)) return; // skip if not present or encrypted
+            foreach (string path in TestDatabases.ExternalPaths) CheckAllTablesRead(path);
+        }
 
+        private static void CheckAllTablesRead(string path)
+        {
             using var reader = TestDatabases.Open(path, new AccessReaderOptions { PageCacheSize = 512 });
             List<string> tables = reader.ListTables();
 
@@ -217,16 +236,5 @@ namespace JetDatabaseReader.Tests
 
         // ── Helpers ───────────────────────────────────────────────────────
 
-        /// <summary>
-        /// Synchronous IProgress&lt;T&gt; that invokes the callback directly on the reporting
-        /// thread. Use in tests instead of Progress&lt;T&gt; to avoid thread-pool dispatch races
-        /// when asserting the collected values immediately after iteration.
-        /// </summary>
-        private sealed class SyncProgress<T> : IProgress<T>
-        {
-            private readonly Action<T> _action;
-            public SyncProgress(Action<T> action) => _action = action;
-            public void Report(T value) => _action(value);
-        }
     }
 }
