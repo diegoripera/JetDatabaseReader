@@ -36,6 +36,12 @@
     <None Include="Test_Autonumber_linked.accdb">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </None>
+    <!-- Fixed-length Text (CHAR(20)) and Binary (BINARY(16)) columns, created through ACE with
+         DDL. Neither Access's table designer nor the other fixtures produce a fixed-length Text
+         column, which is how its decoding went unchecked. -->
+    <None Include="FixedLength.accdb">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
     <!-- A matched pair of empty Jet4 databases holding the same three rows, one with a database
          password set and one without. They are here because the password fixtures that existed
          before were local-only, so nothing in a clean clone covered either case — and that is

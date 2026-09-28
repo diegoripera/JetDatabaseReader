@@ -2709,6 +2709,16 @@ namespace JetDatabaseReader
                     case T_MONEY:    return MoneyToDecimal(BitConverter.ToInt64(row, start));
                     case T_NUMERIC:  return ReadNumericValue(row, start, col);
                     case T_GUID:     return ReadGuidValue(row, start);
+
+                    // Fixed-length Text (DDL CHAR(n)) and Binary live in the fixed area but hold
+                    // the same bytes a variable column would, over the column's full declared
+                    // length. Text is stored padded with spaces, and ACE returns the padding, so
+                    // it is kept. These used to fall through to a hex rendering of the first
+                    // 8 bytes, which is both wrong and truncated: "ABC12" read as
+                    // "41-00-42-00-43-00-31-00".
+                    case T_TEXT:
+                    case T_BINARY:   return ReadVarTyped(row, start, sz, col);
+
                     default:         return NullIfEmpty(BitConverter.ToString(row, start, Math.Min(sz, 8)));
                 }
             }
@@ -2854,6 +2864,13 @@ namespace JetDatabaseReader
                         return ReadNumeric(row, start, col);
                     case T_GUID:
                         return ReadGuid(row, start);
+
+                    // See ReadFixedTyped: fixed-length Text and Binary decode exactly as the
+                    // variable-area forms do, over the declared length.
+                    case T_TEXT:
+                    case T_BINARY:
+                        return ReadVar(row, start, sz, col);
+
                     default:
                         return BitConverter.ToString(row, start, Math.Min(sz, 8));
                 }

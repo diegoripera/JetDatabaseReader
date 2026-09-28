@@ -38,6 +38,15 @@ namespace JetDatabaseReader.Tests
             Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Test_Autonumber_linked.accdb");
 
         /// <summary>
+        /// Two tables whose columns live in the row's fixed area although they are not numbers:
+        /// <c>FixedText</c> (two <c>CHAR(20)</c> columns, one declared <c>WITH COMPRESSION</c>)
+        /// and <c>FixedBinary</c> (a <c>BINARY(16)</c>). Created through ACE with DDL, so the
+        /// expected values are the ones ACE returned.
+        /// </summary>
+        public static readonly string FixedLengthDb =
+            Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "FixedLength.accdb");
+
+        /// <summary>
         /// A matched pair of Jet4 databases holding the same three rows, one with a database
         /// password set and one without. Both are in the repository, unlike the older
         /// password fixtures — the stored password is masked with the database's creation date,

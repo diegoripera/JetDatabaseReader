@@ -5,6 +5,25 @@ This project follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [Unreleased]
+
+### 🐛 Fixed-length Text and Binary columns
+
+A fixed-length Text column (DDL `CHAR(n)`) or a Binary column stored in the row's fixed area came
+back as a hex rendering of its first 8 bytes, in every API: `ABC12` read as
+`41-00-42-00-43-00-31-00`. The value was wrong and truncated, so no caller could recover it. The
+fixed-area reader only knew the numeric, date, GUID and decimal types; everything else fell through
+to that rendering.
+
+Both now decode exactly as their variable-area forms do, over the column's declared length. Text
+keeps the trailing spaces it is stored with, because that is what the Access engine returns
+(`"ABC12               "` for a `CHAR(20)`). A `BINARY(16)` now renders all 16 bytes instead of 8.
+
+`FixedLength.accdb`, created through ACE with DDL, covers both; `compare-with-access` reports it
+matching Access, and a Jet4 `.mdb` built the same way matches too.
+
+---
+
 ## [3.0.0] — 2026-08-08
 
 The first release compared cell by cell against the Access engine itself. That comparison found six
