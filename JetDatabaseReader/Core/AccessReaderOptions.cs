@@ -59,5 +59,12 @@ namespace JetDatabaseReader
         /// Set to <see cref="FileShare.ReadWrite"/> when another application (e.g. Microsoft Access) holds a write lock on the file.
         /// </summary>
         public FileShare FileShare { get; set; } = FileShare.ReadWrite;
+
+        /// <summary>
+        /// Allow reading rows written before columns were deleted from a table. Default: false.
+        /// Such rows can have more stored columns than the current schema; their values may be
+        /// misaligned. Enable only when the relevant tables have been verified against Access.
+        /// </summary>
+        public bool AllowDeletedColumnGaps { get; set; }
     }
 }

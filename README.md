@@ -300,6 +300,7 @@ var options = new AccessReaderOptions
     DiagnosticsEnabled = false,  // verbose logging (default: false)
     ValidateOnOpen     = true,   // format check on open (default: true)
     OleObjectMode      = OleObjectMode.Placeholder,  // skip OLE payloads (default: DataUri)
+    AllowDeletedColumnGaps = false, // reject pre-deletion rows in tables with deleted columns (default)
     FileAccess         = FileAccess.Read,       // default
     FileShare          = FileShare.ReadWrite,   // default: another app may hold the file open
 };
@@ -310,6 +311,13 @@ using var reader = AccessReader.Open("database.mdb", options);
 payload — the blob's LVAL pages are never read and no base64 string is built. Use it when scanning
 a table whose attachments you do not need; `DataUri` (the default) returns a `data:` URI and costs
 the blob plus a string about 1.33x its size.
+
+When a table has deleted-column gaps, older rows can still carry more stored columns than its
+current schema. The reader rejects these rows by default because the remaining values may be
+misaligned. For a database whose affected tables you have checked against Microsoft Access, set
+`AllowDeletedColumnGaps = true` to read them without this guard. This does not repair the database
+or guarantee that every historical row layout is decoded correctly; Compact & Repair in Access
+is the safer option when available.
 
 > `ParallelPageReadsEnabled` exists on the options and the reader but currently has no effect —
 > nothing reads it. It is kept for binary compatibility.

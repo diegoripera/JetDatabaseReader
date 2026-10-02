@@ -139,6 +139,7 @@ namespace JetDatabaseReader
         private long _cacheHits;
         private long _cacheMisses;
         private readonly bool _isPasswordProtected;
+        private readonly bool _allowDeletedColumnGaps;
 
         /// <summary>Page decryptor for an encrypted ACE database; null when pages are plain text.</summary>
         private AgileEncryption _crypto;
@@ -183,6 +184,7 @@ namespace JetDatabaseReader
             ParallelPageReadsEnabled = options.ParallelPageReadsEnabled;
 #pragma warning restore CS0618
             OleObjectMode = options.OleObjectMode;
+            _allowDeletedColumnGaps = options.AllowDeletedColumnGaps;
 
             // Two deliberate choices here:
             //
@@ -2539,7 +2541,7 @@ namespace JetDatabaseReader
             // Check for deleted-column schema mismatch
             // If the table has deleted columns AND this row has MORE columns than current schema,
             // it was written before the deletion and data alignment is ambiguous
-            if (shape.Table.HasDeletedColumns && numCols > shape.Table.Columns.Count)
+            if (!_allowDeletedColumnGaps && shape.Table.HasDeletedColumns && numCols > shape.Table.Columns.Count)
             {
                 throw new JetLimitationException(
                     $"Row has {numCols} columns but current schema has {shape.Table.Columns.Count} with deleted-column gaps. " +
